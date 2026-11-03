@@ -378,14 +378,33 @@ function renderStatusLine() {
   }
   const t = tabs.get(r.tabId);
   let html = `<span class="url main">${esc(t?.url ?? "")}</span>`;
-  const subject = activeSorter() === nanoSorter ? nanoSorter.subjectOf(r.tabId) : undefined;
-  if (subject) html += `<span class="url">AI: about “${esc(subject)}”</span>`;
+  if (r.section !== "dupe") html += `<span class="url">${esc(sortExplanation(r.tabId))}</span>`;
   if (r.section === "dupe") {
     const keepId = S.plan!.duplicates.find((d) => d.closeId === r.tabId)?.keepId;
     const k = keepId !== undefined ? tabs.get(keepId) : undefined;
     if (k) html += `<span class="url">keeps ${esc(k.url)}</span>`;
   }
   el.innerHTML = html;
+}
+
+/** One line on how the current tab was sorted, for checking the AI's work. */
+function sortExplanation(tabId: number): string {
+  if (activeSorter() !== nanoSorter) {
+    const why: Record<NanoStatus, string> = {
+      available: "on-device AI is switched off",
+      downloadable: "the on-device AI model isn't downloaded yet",
+      downloading: "the on-device AI model is still downloading",
+      unavailable: "Chrome says on-device AI isn't available on this computer",
+      unsupported: "this Chrome has no on-device AI (needs Chrome 138 or later)",
+    };
+    return `Sorted by website: ${why[S.aiStatus]}.`;
+  }
+  const subject = nanoSorter.subjectOf(tabId);
+  if (!subject) {
+    const err = nanoSorter.lastError;
+    return `AI: no answer for this tab, so it was sorted by website.${err ? ` Error: ${err}` : ""}`;
+  }
+  return `AI: about “${subject}”`;
 }
 
 /* ---------------------------------------------------------------- data */
@@ -469,7 +488,8 @@ function renderSorter() {
   }
   if (activeSorter() === nanoSorter) {
     const fb = nanoSorter.lastFallbackCount;
-    el.innerHTML = `Sorted by on-device AI${fb ? ` (${fb} by website)` : ""} · ${button("site", "Sort by website instead")}`;
+    const err = nanoSorter.lastError;
+    el.innerHTML = `Sorted by on-device AI${fb ? ` <span${err ? ` title="${esc(err)}"` : ""}>(${fb} by website, the AI failed on them)</span>` : ""} · ${button("site", "Sort by website instead")}`;
     return;
   }
   const why: Record<NanoStatus, string> = {

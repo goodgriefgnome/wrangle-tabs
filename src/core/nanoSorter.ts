@@ -212,6 +212,8 @@ export class NanoSorter implements Sorter {
   readonly label = "Sorted by on-device AI";
   /** Tabs the model failed on in the last sort, which were sorted by website instead. */
   lastFallbackCount = 0;
+  /** The last error from the model in the last sort, if any. */
+  lastError: string | null = null;
   private subjects = new Map<string, string>();
   private topics = new Map<string, SortTarget>();
   private topicSignature = "";
@@ -229,6 +231,7 @@ export class NanoSorter implements Sorter {
 
   async sort(input: SortInput, options: SortOptions = {}): Promise<Map<number, SortTarget>> {
     const { signal, onProgress } = options;
+    this.lastError = null;
     const signature = groupSignature(input);
     if (signature !== this.topicSignature) {
       this.topics.clear();
@@ -339,6 +342,7 @@ export class NanoSorter implements Sorter {
       } catch (e) {
         if (signal?.aborted) throw e;
         console.warn("On-device AI couldn't handle a batch; those tabs are sorted by website.", e);
+        this.lastError = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
       } finally {
         session?.destroy();
       }
