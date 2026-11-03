@@ -20,8 +20,8 @@ export type SortTarget =
 export interface SortOptions {
   /** Aborted when a newer sort supersedes this one. */
   signal?: AbortSignal;
-  /** Called as tabs get sorted, for slow sorters. */
-  onProgress?: (done: number, total: number) => void;
+  /** Called as tabs get sorted, for slow sorters. `phase` names a step that has no count. */
+  onProgress?: (done: number, total: number, phase?: "grouping") => void;
 }
 
 export interface Sorter {

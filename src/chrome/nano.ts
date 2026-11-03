@@ -49,19 +49,20 @@ export async function downloadNano(onProgress: (fraction: number) => void): Prom
 }
 
 /**
- * Sessions for the sorter. One base session holds the system prompt; each batch
- * gets a clone of it, so batches don't see each other's history.
+ * Sessions for the sorter. One base session per system prompt; each batch gets
+ * a clone of it, so batches don't see each other's history.
  */
 export function nanoSessionFactory(): SessionFactory {
-  let base: Promise<Awaited<ReturnType<LanguageModelStatic["create"]>>> | null = null;
-  let basePrompt = "";
+  type Base = Awaited<ReturnType<LanguageModelStatic["create"]>>;
+  const bases = new Map<string, Promise<Base>>();
   return async (systemPrompt, signal) => {
     const lm = api();
     if (!lm) throw new Error("This version of Chrome has no built-in AI.");
-    if (!base || basePrompt !== systemPrompt) {
-      basePrompt = systemPrompt;
+    let base = bases.get(systemPrompt);
+    if (!base) {
       base = lm.create({ ...LANGUAGES, initialPrompts: [{ role: "system", content: systemPrompt }] });
-      base.catch(() => (base = null));
+      bases.set(systemPrompt, base);
+      base.catch(() => bases.delete(systemPrompt));
     }
     return (await base).clone({ signal });
   };

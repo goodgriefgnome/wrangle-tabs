@@ -32,7 +32,7 @@ const S = {
   modal: null as null | ((e: KeyboardEvent) => void),
   busy: false,
   /** Progress of a slow (AI) sort, while one is running. */
-  sorting: null as null | { done: number; total: number },
+  sorting: null as null | { done: number; total: number; phase?: "grouping" },
   aiStatus: "unsupported" as NanoStatus,
   sorterPref: "ai" as SorterPref,
   /** Model download progress (0..1) while this page is downloading it. */
@@ -277,7 +277,7 @@ function render() {
   renderSorter();
   if (!S.plan) {
     const p = S.sorting;
-    listEl.innerHTML = `<div class="row info">${p ? `Sorting your tabs with on-device AI… ${p.done} of ${p.total}` : "Reading your tabs…"}</div>`;
+    listEl.innerHTML = `<div class="row info">${p ? (p.phase ? "Grouping topics with on-device AI…" : `Reading tabs with on-device AI… ${p.done} of ${p.total}`) : "Reading your tabs…"}</div>`;
     return;
   }
   rows = buildRows(S.plan);
@@ -378,6 +378,8 @@ function renderStatusLine() {
   }
   const t = tabs.get(r.tabId);
   let html = `<span class="url main">${esc(t?.url ?? "")}</span>`;
+  const subject = activeSorter() === nanoSorter ? nanoSorter.subjectOf(r.tabId) : undefined;
+  if (subject) html += `<span class="url">AI: about “${esc(subject)}”</span>`;
   if (r.section === "dupe") {
     const keepId = S.plan!.duplicates.find((d) => d.closeId === r.tabId)?.keepId;
     const k = keepId !== undefined ? tabs.get(keepId) : undefined;
@@ -430,9 +432,9 @@ async function replan() {
       sorter: activeSorter(),
       sortOptions: {
         signal: abort.signal,
-        onProgress: (done, total) => {
+        onProgress: (done, total, phase) => {
           if (!current() || total === 0) return;
-          S.sorting = { done, total };
+          S.sorting = { done, total, phase };
           if (S.plan) {
             renderSorter();
             renderSummary();
@@ -456,7 +458,9 @@ function renderSorter() {
   const button = (act: string, label: string, title = "") =>
     `<button type="button" class="link" data-act="${act}"${title ? ` title="${esc(title)}"` : ""}>${label}</button>`;
   if (S.sorting) {
-    el.innerHTML = `Sorting with on-device AI… ${S.sorting.done} of ${S.sorting.total} tabs`;
+    el.innerHTML = S.sorting.phase
+      ? "Grouping topics with on-device AI…"
+      : `Reading tabs with on-device AI… ${S.sorting.done} of ${S.sorting.total}`;
     return;
   }
   if (S.download !== null) {
