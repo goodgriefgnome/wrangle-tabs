@@ -130,3 +130,6 @@ button kbd { margin-left: 6px; background: transparent; border-color: currentCol
   .toast { animation: rise 160ms ease-out; }
   @keyframes rise { from { transform: translate(-50%, 6px); opacity: 0; } }
 }
+
+button.link { font: inherit; font-weight: 500; padding: 0; border: 0; background: none; color: var(--accent); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+button.link:focus-visible { outline: 2px solid var(--cursor-edge); outline-offset: 2px; border-radius: 2px; }

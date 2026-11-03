@@ -1,14 +1,18 @@
 import "./style.css";
 import { applyActions, switchToTab, type Actions } from "../chrome/apply";
 import { takeSnapshot } from "../chrome/snapshot";
-import { loadState, saveLeftoversWindowId, saveUserGroups } from "../chrome/storage";
+import { downloadNano, nanoSessionFactory, nanoStatus, type NanoStatus } from "../chrome/nano";
+import { loadState, saveLeftoversWindowId, saveSorterPref, saveUserGroups, type SorterPref } from "../chrome/storage";
+import { NanoSorter } from "../core/nanoSorter";
 import { buildPlan, type ManualTarget, type NewGroupPlan, type Plan } from "../core/plan";
 import { SiteSorter } from "../core/siteSorter";
+import type { Sorter } from "../core/sorter";
 import { GROUP_COLORS, type GroupColor, type GroupInfo, type Snapshot, type TabInfo, type UserGroup } from "../core/types";
 
 /* ---------------------------------------------------------------- state */
 
-const sorter = new SiteSorter();
+const siteSorter = new SiteSorter();
+const nanoSorter = new NanoSorter(nanoSessionFactory(), siteSorter);
 
 const S = {
   snapshot: null as Snapshot | null,
@@ -27,6 +31,12 @@ const S = {
   renaming: null as string | null,
   modal: null as null | ((e: KeyboardEvent) => void),
   busy: false,
+  /** Progress of a slow (AI) sort, while one is running. */
+  sorting: null as null | { done: number; total: number },
+  aiStatus: "unsupported" as NanoStatus,
+  sorterPref: "ai" as SorterPref,
+  /** Model download progress (0..1) while this page is downloading it. */
+  download: null as number | null,
 };
 
 const tabs = new Map<number, TabInfo>();
@@ -264,7 +274,12 @@ function rowHTML(r: Row): string {
 /* ---------------------------------------------------------------- render */
 
 function render() {
-  if (!S.plan) return;
+  renderSorter();
+  if (!S.plan) {
+    const p = S.sorting;
+    listEl.innerHTML = `<div class="row info">${p ? `Sorting your tabs with on-device AI… ${p.done} of ${p.total}` : "Reading your tabs…"}</div>`;
+    return;
+  }
   rows = buildRows(S.plan);
   const nav = navRows();
   if (!nav.some((r) => r.key === S.cursor)) {
@@ -294,7 +309,6 @@ function renderStats() {
   $("#stats").innerHTML =
     `<span><b>${all.length}</b> tabs</span><span><b>${windows.size}</b> windows</span>` +
     `<span class="warn"><b>${ungrouped}</b> ungrouped</span><span><b>${dupes}</b> duplicates</span>`;
-  $("#sorter").textContent = sorter.label;
 }
 
 function renderWindows() {
@@ -347,7 +361,7 @@ function summaryParts(a: Actions): string[] {
 function renderSummary() {
   const parts = summaryParts(collectActions());
   $("#summary").innerHTML = parts.length ? "Ticked: " + parts.join(" · ") : "Nothing ticked.";
-  $<HTMLButtonElement>("#apply").disabled = !parts.length || S.busy;
+  $<HTMLButtonElement>("#apply").disabled = !parts.length || S.busy || !!S.sorting;
 }
 
 function renderStatusLine() {
@@ -392,16 +406,114 @@ async function rescan() {
   await replan();
 }
 
+function activeSorter(): Sorter {
+  return S.sorterPref === "ai" && S.aiStatus === "available" ? nanoSorter : siteSorter;
+}
+
+let replanGeneration = 0;
+let replanAbort: AbortController | null = null;
+
+/** Re-sorts. A newer call cancels an older one that is still running. */
 async function replan() {
   if (!S.snapshot) return;
-  S.plan = await buildPlan({
-    snapshot: S.snapshot,
-    userGroups: S.userGroups,
-    manual: S.manual,
-    aiOverrides: S.aiOverrides,
-    sorter,
-  });
+  const generation = ++replanGeneration;
+  replanAbort?.abort();
+  const abort = new AbortController();
+  replanAbort = abort;
+  const current = () => generation === replanGeneration;
+  try {
+    const plan = await buildPlan({
+      snapshot: S.snapshot,
+      userGroups: S.userGroups,
+      manual: S.manual,
+      aiOverrides: S.aiOverrides,
+      sorter: activeSorter(),
+      sortOptions: {
+        signal: abort.signal,
+        onProgress: (done, total) => {
+          if (!current() || total === 0) return;
+          S.sorting = { done, total };
+          if (S.plan) {
+            renderSorter();
+            renderSummary();
+          } else render();
+        },
+      },
+    });
+    if (!current()) return;
+    S.plan = plan;
+  } catch (e) {
+    if (abort.signal.aborted) return;
+    throw e;
+  } finally {
+    if (current()) S.sorting = null;
+  }
   render();
+}
+
+function renderSorter() {
+  const el = $("#sorter");
+  const button = (act: string, label: string, title = "") =>
+    `<button type="button" class="link" data-act="${act}"${title ? ` title="${esc(title)}"` : ""}>${label}</button>`;
+  if (S.sorting) {
+    el.innerHTML = `Sorting with on-device AI… ${S.sorting.done} of ${S.sorting.total} tabs`;
+    return;
+  }
+  if (S.download !== null) {
+    el.innerHTML = `Downloading the AI model… ${Math.round(S.download * 100)}%`;
+    return;
+  }
+  if (activeSorter() === nanoSorter) {
+    const fb = nanoSorter.lastFallbackCount;
+    el.innerHTML = `Sorted by on-device AI${fb ? ` (${fb} by website)` : ""} · ${button("site", "Sort by website instead")}`;
+    return;
+  }
+  const why: Record<NanoStatus, string> = {
+    available: button("ai", "Use on-device AI"),
+    downloadable: button(
+      "download",
+      "Use on-device AI",
+      "Downloads Chrome's built-in model (Gemini Nano) once. It runs on this computer; your tabs are never sent anywhere.",
+    ),
+    downloading: button("download", "Use on-device AI (download in progress)"),
+    unavailable: "On-device AI isn't available on this computer.",
+    unsupported: "On-device AI needs Chrome 138 or later.",
+  };
+  el.innerHTML = `Sorted by website · ${why[S.aiStatus]}`;
+}
+
+$("#sorter").addEventListener("click", (e) => {
+  const act = (e.target as HTMLElement).closest<HTMLElement>("[data-act]")?.dataset.act;
+  if (act === "site" || act === "ai") void setSorterPref(act);
+  else if (act === "download") void startDownload();
+});
+
+async function setSorterPref(pref: SorterPref) {
+  S.sorterPref = pref;
+  await saveSorterPref(pref);
+  renderSorter();
+  await replan();
+}
+
+async function startDownload() {
+  S.download = 0;
+  // Start the download first: Chrome only allows it straight after a click.
+  const done = downloadNano((f) => {
+    S.download = f;
+    renderSorter();
+  });
+  renderSorter();
+  try {
+    await done;
+    S.aiStatus = await nanoStatus();
+    S.download = null;
+    await setSorterPref("ai");
+  } catch (e) {
+    S.download = null;
+    S.aiStatus = await nanoStatus();
+    renderSorter();
+    toast(`Couldn't download the AI model: ${e instanceof Error ? e.message : String(e)}`);
+  }
 }
 
 /* ---------------------------------------------------------------- actions */
@@ -741,6 +853,7 @@ function openPropose() {
 function openApply() {
   const actions = collectActions();
   const parts = summaryParts(actions);
+  if (S.sorting) return toast("Still sorting. Try again in a moment.");
   if (!parts.length) return toast("Tick something first.");
   const total =
     actions.close.length +
@@ -932,6 +1045,8 @@ chrome.runtime.onMessage.addListener((msg: { type?: string }) => {
   const stored = await loadState();
   S.userGroups = stored.userGroups;
   S.leftoversWindowId = stored.leftoversWindowId;
+  S.sorterPref = stored.sorterPref;
+  S.aiStatus = await nanoStatus();
   await rescan();
   listEl.focus({ preventScroll: true });
 })();

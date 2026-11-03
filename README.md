@@ -35,7 +35,13 @@ Pinned tabs never appear on the dashboard and are never moved.
 
 ## Sorting
 
-Stage 1 sorts by website: tabs go into your proposed groups by matching words in the group's name and hint, then into the existing group that already holds tabs from the same site, then into a new group per site with two or more tabs. Stage 2 replaces this with Chrome's built-in AI (Gemini Nano), which runs on your machine.
+Tabs are sorted by Chrome's built-in AI model (Gemini Nano), which runs on your computer: your tabs are never sent anywhere. The model sees each ungrouped tab's title and site, your existing groups (with a few example titles), and the groups you proposed, and picks a group or a short new topic for each tab. A topic with only one tab goes to the Leftovers window.
+
+The first time, click **Use on-device AI** at the top right of the dashboard to download the model (a one-time download of a few GB). Chrome's requirements: Chrome 138 or later on Windows, macOS, Linux or a Chromebook Plus, 22 GB of free disk space, and either a GPU with more than 4 GB of video memory or 16 GB of RAM. `chrome://on-device-internals` shows the model's status.
+
+Where the model isn't available, or after **Sort by website instead**, tabs are sorted by website: your proposed groups first (by matching words in their name and hint), then the existing group that already holds tabs from the same site, then a new group per site with two or more tabs.
+
+Sorting with the model takes a few seconds per batch of tabs; the dashboard shows progress and can't apply changes until it's done. Answers are remembered per tab, so re-scans only ask about tabs that are new, until your groups change.
 
 ## Keys
 
@@ -73,7 +79,7 @@ To load a local build, follow the install steps above with the `dist/` folder. A
 
 ### Layout
 
-- `src/core/` — pure logic, no Chrome APIs: URL cleanup, duplicate detection, the sorter interface and the plan builder. Covered by `tests/`.
-- `src/chrome/` — reading tabs, applying changes, storage.
+- `src/core/` — pure logic, no Chrome APIs: URL cleanup, duplicate detection, the sorters and the plan builder. Covered by `tests/` (the AI sorter is tested against a scripted fake model).
+- `src/chrome/` — reading tabs, applying changes, storage, and the Prompt API (`nano.ts`).
 - `src/dashboard/` — the dashboard page.
 - `src/background.ts` — opens or focuses the dashboard.
