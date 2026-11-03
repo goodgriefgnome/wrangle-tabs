@@ -4,6 +4,16 @@ A Chrome extension that closes duplicate tabs and sorts the rest into tab groups
 
 Click the toolbar button (or press **Alt+Shift+T**) to open the dashboard. It lists every suggested change, all ticked. Untick what you don't want and press **Shift+Enter** to apply the rest. Unticked suggestions stay on the page for later.
 
+## Install
+
+1. Download **[wrangle-tabs.zip](https://github.com/goodgriefgnome/wrangle-tabs/releases/download/latest/wrangle-tabs.zip)** (built automatically from `main`) and unzip it.
+2. Open `chrome://extensions` and turn on **Developer mode** (top right).
+3. Click **Load unpacked** and choose the unzipped folder.
+
+To update, download and unzip the new build over the same folder, then click the reload icon on the extension's card.
+
+Builds of other branches are on the [Actions](https://github.com/goodgriefgnome/wrangle-tabs/actions) page: open a run and download **wrangle-tabs** under *Artifacts*.
+
 ## What it does
 
 **Closes duplicates.** Two tabs are duplicates when their URLs match after cleanup (case, `www.`, `http`/`https`, trailing `/`, and tracking parameters such as `utm_*` and `fbclid` are ignored). If the URLs differ only after the `#`, the titles must match too, so `…/docs#section` matches `…/docs`, but Gmail's `#inbox` and `#label/receipts` don't.
@@ -57,7 +67,7 @@ npm run build   # type-checks and builds into dist/
 npm test        # unit tests for duplicate detection and sorting
 ```
 
-To load it in Chrome: open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked** and choose the `dist/` folder. After rebuilding, click the reload icon on the extension's card.
+To load a local build, follow the install steps above with the `dist/` folder. After rebuilding, click the reload icon on the extension's card.
 
 `npm run watch` rebuilds on every change.
 

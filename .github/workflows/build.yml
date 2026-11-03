@@ -1,0 +1,48 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+
+      # Downloadable from the run's Summary page, for any branch.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wrangle-tabs
+          path: dist/
+          if-no-files-found: error
+
+      # Builds from main also go to a "latest" release with a fixed download link.
+      - name: Update the "latest" release
+        if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd dist && zip -qr ../wrangle-tabs.zip .)
+          git tag -f latest
+          git push -f origin latest
+          notes="Built from ${GITHUB_SHA::7} on $(date -u +%Y-%m-%d). Unzip, then load the folder at chrome://extensions with Developer mode on (Load unpacked)."
+          if gh release view latest >/dev/null 2>&1; then
+            gh release edit latest --notes "$notes"
+          else
+            gh release create latest --prerelease --title "Latest build" --notes "$notes"
+          fi
+          gh release upload latest wrangle-tabs.zip --clobber
