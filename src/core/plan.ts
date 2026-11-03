@@ -1,5 +1,5 @@
 import { findDuplicates } from "./duplicates";
-import type { Sorter } from "./sorter";
+import type { Sorter, SortOptions } from "./sorter";
 import {
   GROUP_COLORS,
   type DuplicateSuggestion,
@@ -44,11 +44,12 @@ export interface PlanInput {
   /** Renames and recolors of suggested ("ai:") groups. */
   aiOverrides?: Map<string, { name?: string; color?: GroupColor }>;
   sorter: Sorter;
+  sortOptions?: SortOptions;
 }
 
 const byPosition = (a: TabInfo, b: TabInfo) => a.windowId - b.windowId || a.index - b.index;
 
-export async function buildPlan({ snapshot, userGroups, manual, aiOverrides, sorter }: PlanInput): Promise<Plan> {
+export async function buildPlan({ snapshot, userGroups, manual, aiOverrides, sorter, sortOptions }: PlanInput): Promise<Plan> {
   const { tabs, groups, leftoversWindowId } = snapshot;
   const { duplicates, notes } = findDuplicates(tabs, groups);
   const closing = new Set(duplicates.map((d) => d.closeId));
@@ -73,7 +74,7 @@ export async function buildPlan({ snapshot, userGroups, manual, aiOverrides, sor
     tabs: toSort,
     existingGroups: groups.map((group) => ({ group, tabs: tabs.filter((t) => t.groupId === group.id) })),
     userGroups,
-  });
+  }, sortOptions);
 
   const existing = new Map<number, number[]>();
   const fresh = new Map<string, number[]>();
