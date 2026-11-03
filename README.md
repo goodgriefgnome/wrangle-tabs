@@ -35,7 +35,7 @@ Pinned tabs never appear on the dashboard and are never moved.
 
 ## Sorting
 
-Tabs are sorted by Chrome's built-in AI model (Gemini Nano), which runs on your computer: your tabs are never sent anywhere. The model sees each ungrouped tab's title and site, your existing groups (with a few example titles), and the groups you proposed, and picks a group or a short new topic for each tab. A topic with only one tab goes to the Leftovers window.
+Tabs are sorted by Chrome's built-in AI model (Gemini Nano), which runs on your computer: your tabs are never sent anywhere. For each ungrouped tab, the model writes a short subject and then picks one of your groups or a topic, seeing the tab's title (with the site name removed), your existing groups and the groups you proposed. Topics that are just a website name are rejected, and a topic with only one tab goes to the Leftovers window. While it works, the dashboard shows a progress bar and what goes in and out of the model.
 
 The first time, click **Use on-device AI** at the top right of the dashboard to download the model (a one-time download of a few GB). Chrome's requirements: Chrome 138 or later on Windows, macOS, Linux or a Chromebook Plus, 22 GB of free disk space, and either a GPU with more than 4 GB of video memory or 16 GB of RAM. `chrome://on-device-internals` shows the model's status.
 

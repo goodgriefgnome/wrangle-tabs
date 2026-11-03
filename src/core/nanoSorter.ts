@@ -6,6 +6,8 @@ import { siteOf } from "./url";
 /** The parts of a Prompt API session the sorter uses. */
 export interface ModelSession {
   prompt(input: string, options?: { responseConstraint?: object; signal?: AbortSignal }): Promise<string>;
+  /** Streams the answer in pieces. Used when available, so the dashboard can show it as it arrives. */
+  promptStreaming?(input: string, options?: { responseConstraint?: object; signal?: AbortSignal }): ReadableStream<string>;
   measureContextUsage?(input: string, options?: { responseConstraint?: object }): Promise<number>;
   readonly contextUsage?: number;
   readonly contextWindow?: number;
@@ -15,60 +17,34 @@ export interface ModelSession {
 /** Creates a fresh session that already has the given system prompt. */
 export type SessionFactory = (systemPrompt: string, signal?: AbortSignal) => Promise<ModelSession>;
 
-/*
- * Sorting happens in two steps, because a small model asked to group tabs
- * directly tends to group them by website:
- * 1. Subjects: the model says what each tab is about, in a few words.
- * 2. Topics: the model groups those subjects, without seeing any website names.
- */
-
-export const SUBJECT_PROMPT = `You read web browser tab titles and say what each page is about.
-For each tab, write its subject in 2 to 5 words: the topic, product, place, project or task the page is about.
-Never answer with the name of the website. "YouTube", "GitHub", "Wikipedia", "Reddit" or "Google Docs" are not subjects: say what the video, repository, article, thread or document is about.
+export const SYSTEM_PROMPT = `You sort web browser tabs into tab groups by subject.
+You get a numbered list of groups and a numbered list of tabs. For every tab, first write its subject: what the page is about, in 2 to 5 words. Then pick its group:
+- A group id (such as U1, E2 or N3) when the tab's subject fits that group. Groups proposed by the user come first: use them whenever a tab fits their name or hint.
+- Otherwise a new topic name of one to three words, broad enough to also cover related tabs, such as "Web development", "Japan trip", "Baking" or "Home office". Give tabs on related subjects the same topic, even when they are on different websites.
+- "none" when the tab is unrelated to every group and every other tab.
+Never use the name of a website or app (such as YouTube, GitHub, Wikipedia, Reddit or Google Docs) as a subject or a topic: say what the page itself is about.
 Answer with JSON only.`;
 
-export const TOPIC_PROMPT = `You organise subjects into tab groups.
-You get a numbered list of groups and a numbered list of subjects. Each subject is what one or more browser tabs are about. For every subject, pick where it belongs:
-- A group id (such as U1, E2 or N3) when the subject fits that group's topic. Groups proposed by the user come first: use them whenever a subject fits their name or hint.
-- Otherwise a new topic name of one to three words, broad enough to also cover related subjects, such as "Web development", "Japan trip", "Baking" or "Home office". Give related subjects the same topic name, even when they are worded differently.
-- "none" when the subject is unrelated to every group and every other subject.
-Never use the name of a website or app as a topic.
-Answer with JSON only.`;
-
-const SUBJECT_SCHEMA = {
+const SCHEMA = {
   type: "object",
   properties: {
-    subjects: {
+    tabs: {
       type: "array",
       items: {
         type: "object",
-        properties: { tab: { type: "integer" }, subject: { type: "string" } },
-        required: ["tab", "subject"],
+        // The subject comes first, so the model works out what the tab is about before picking a group.
+        properties: { tab: { type: "integer" }, subject: { type: "string" }, group: { type: "string" } },
+        required: ["tab", "subject", "group"],
       },
     },
   },
-  required: ["subjects"],
-};
-
-const TOPIC_SCHEMA = {
-  type: "object",
-  properties: {
-    assignments: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: { subject: { type: "integer" }, group: { type: "string" } },
-        required: ["subject", "group"],
-      },
-    },
-  },
-  required: ["assignments"],
+  required: ["tabs"],
 };
 
 const MAX_BATCH = 30;
 const MIN_BATCH = 3;
 /** Rough number of tokens the answer uses per item. */
-const OUTPUT_TOKENS_PER_ITEM = 20;
+const OUTPUT_TOKENS_PER_ITEM = 30;
 
 /** Website and app names that are never a subject or a topic on their own. */
 const BRANDS = [
@@ -130,14 +106,7 @@ function groupSignature(input: SortInput): string {
   ]);
 }
 
-export function buildSubjectPrompt(batch: TabInfo[]): string {
-  const lines = ["Tabs:"];
-  batch.forEach((t, i) => lines.push(`${i + 1}. ${clip(cleanTitle(t.title, t.url), 100)} (on ${hostOf(t.url) || "a local page"})`));
-  lines.push("", `Give the subject of each of the ${batch.length} tabs.`);
-  return lines.join("\n");
-}
-
-export function buildTopicPrompt(input: SortInput, topics: string[], subjects: string[]): string {
+export function buildPrompt(input: SortInput, topics: string[], batch: TabInfo[]): string {
   const lines: string[] = ["Groups:"];
   input.userGroups.forEach((g, i) => {
     lines.push(`U${i + 1}: ${quote(g.name)} (proposed by the user)${g.hint ? `. Hint: ${clip(g.hint, 120)}` : ""}`);
@@ -149,28 +118,32 @@ export function buildTopicPrompt(input: SortInput, topics: string[], subjects: s
       .join("; ");
     lines.push(`E${i + 1}: ${quote(group.title || "Unnamed group")} (existing group)${examples ? `. It holds: ${examples}` : ""}`);
   });
-  topics.forEach((name, i) => lines.push(`N${i + 1}: ${quote(name)} (new topic, already used for other subjects)`));
+  topics.forEach((name, i) => lines.push(`N${i + 1}: ${quote(name)} (new topic, already used for other tabs)`));
   if (lines.length === 1) lines.push("None yet.");
-  lines.push("", "Subjects:");
-  subjects.forEach((s, i) => lines.push(`${i + 1}. ${s}`));
+  lines.push("", "Tabs:");
+  batch.forEach((t, i) => {
+    const title = cleanTitle(t.title, t.url);
+    // The website only helps with very short titles ("useEffect"); otherwise it tempts the model to group by site.
+    const short = title.split(/\s+/).length < 4;
+    lines.push(`${i + 1}. ${clip(title, 100)}${short && hostOf(t.url) ? ` (on ${hostOf(t.url)})` : ""}`);
+  });
   lines.push(
     "",
-    `For each of the ${subjects.length} subjects, answer with its number and a group: a group id, a new topic name, or "none".`,
+    `For each of the ${batch.length} tabs, answer with its number, its subject, and its group: a group id, a new topic name, or "none".`,
   );
   return lines.join("\n");
 }
 
-/** Reads `{ <listKey>: [{ <idKey>: n, <valueKey>: "…" }] }` into n -> text. Throws on anything else. */
-export function parseAnswer(raw: string, listKey: string, idKey: string, valueKey: string): Map<number, string> {
+/** Reads the model's answer into tab number -> { subject, group }. Throws when it isn't the expected JSON. */
+export function parseAnswer(raw: string): Map<number, { subject: string; group: string }> {
   const json = raw.trim().replace(/^```(?:json)?\s*|\s*```$/g, "");
-  const data = JSON.parse(json) as Record<string, unknown>;
-  const list = data[listKey];
-  if (!Array.isArray(list)) throw new Error(`Answer has no ${listKey}`);
-  const out = new Map<number, string>();
-  for (const item of list as Record<string, unknown>[]) {
-    const id = item[idKey];
-    const value = item[valueKey];
-    if (typeof id === "number" && typeof value === "string") out.set(id, value);
+  const data = JSON.parse(json) as { tabs?: { tab?: unknown; subject?: unknown; group?: unknown }[] };
+  if (!Array.isArray(data.tabs)) throw new Error("Answer has no tabs");
+  const out = new Map<number, { subject: string; group: string }>();
+  for (const a of data.tabs) {
+    if (typeof a.tab === "number" && typeof a.group === "string") {
+      out.set(a.tab, { subject: typeof a.subject === "string" ? a.subject : "", group: a.group });
+    }
   }
   return out;
 }
@@ -207,6 +180,15 @@ export function resolveAnswer(answer: string, input: SortInput, topics: string[]
  *   So re-scans only ask about new tabs.
  * - A topic with a single tab goes to Leftovers.
  * - Tabs the model fails on are sorted by website.
+
+/**
+ * Sorts tabs with Chrome's built-in model (Gemini Nano). For each tab the model
+ * writes a subject and then picks a group, in one answer.
+ * - Tabs go to the model in batches that fit its context window. Topic names
+ *   from earlier batches are offered to later ones, so topics stay consistent.
+ * - Answers are remembered per tab until the groups change, so re-scans only ask about new tabs.
+ * - Website names are rejected as topics; a topic with a single tab goes to Leftovers.
+ * - Tabs the model fails on are sorted by website.
  */
 export class NanoSorter implements Sorter {
   readonly label = "Sorted by on-device AI";
@@ -214,9 +196,8 @@ export class NanoSorter implements Sorter {
   lastFallbackCount = 0;
   /** The last error from the model in the last sort, if any. */
   lastError: string | null = null;
-  private subjects = new Map<string, string>();
-  private topics = new Map<string, SortTarget>();
-  private topicSignature = "";
+  private cache = new Map<string, { subject: string; target: SortTarget }>();
+  private cacheSignature = "";
   private lastSubjects = new Map<number, string>();
 
   constructor(
@@ -230,74 +211,81 @@ export class NanoSorter implements Sorter {
   }
 
   async sort(input: SortInput, options: SortOptions = {}): Promise<Map<number, SortTarget>> {
-    const { signal, onProgress } = options;
+    const { signal, onProgress, onModel } = options;
     this.lastError = null;
     const signature = groupSignature(input);
-    if (signature !== this.topicSignature) {
-      this.topics.clear();
-      this.topicSignature = signature;
+    if (signature !== this.cacheSignature) {
+      this.cache.clear();
+      this.cacheSignature = signature;
     }
     const siteLabels = new Set(
       [...input.tabs, ...input.existingGroups.flatMap((g) => g.tabs)].map((t) => siteLabel(t.url)).filter((l): l is string => !!l),
     );
 
-    // Step 1: subjects.
-    const todo = input.tabs.filter((t) => !this.subjects.has(tabKey(t)));
-    onProgress?.(0, todo.length);
-    await this.inBatches(todo, SUBJECT_PROMPT, SUBJECT_SCHEMA, buildSubjectPrompt, signal, (batch, raw) => {
-      const answers = parseAnswer(raw, "subjects", "tab", "subject");
-      batch.forEach((t, k) => {
-        let subject = answers.get(k + 1)?.trim().replace(/\s+/g, " ");
-        if (subject === undefined) return;
-        if (isSiteName(subject, siteLabels)) subject = cleanTitle(t.title, t.url);
-        this.subjects.set(tabKey(t), clip(subject, 60));
-      });
-    }, (done) => onProgress?.(done, todo.length));
-
+    const result = new Map<number, SortTarget>();
     this.lastSubjects = new Map();
+    const todo: TabInfo[] = [];
     for (const t of input.tabs) {
-      const s = this.subjects.get(tabKey(t));
-      if (s) this.lastSubjects.set(t.id, s);
+      const hit = this.cache.get(tabKey(t));
+      if (hit) {
+        result.set(t.id, hit.target);
+        if (hit.subject) this.lastSubjects.set(t.id, hit.subject);
+      } else todo.push(t);
     }
 
-    // Step 2: topics for subjects not seen since the groups last changed.
-    const known: string[] = [];
+    const topics: string[] = [];
     const addTopic = (name: string) => {
-      if (!known.some((t) => normName(t) === normName(name))) known.push(name);
-      return known.find((t) => normName(t) === normName(name))!;
+      const found = topics.find((t) => normName(t) === normName(name));
+      if (found) return found;
+      topics.push(name);
+      return name;
     };
-    for (const v of this.topics.values()) if (v.kind === "new") addTopic(v.name);
-    const subjectsTodo = [...new Map([...this.lastSubjects.values()].map((s) => [normName(s), s])).entries()]
-      .filter(([n]) => !this.topics.has(n))
-      .map(([, s]) => s);
-    if (subjectsTodo.length) onProgress?.(0, subjectsTodo.length, "grouping");
-    await this.inBatches(
-      subjectsTodo,
-      TOPIC_PROMPT,
-      TOPIC_SCHEMA,
-      (batch) => buildTopicPrompt(input, known, batch),
-      signal,
-      (batch, raw) => {
-        const answers = parseAnswer(raw, "assignments", "subject", "group");
-        const offered = [...known];
-        batch.forEach((subject, k) => {
+    for (const v of result.values()) if (v.kind === "new") addTopic(v.name);
+
+    onProgress?.(0, todo.length);
+    let size = MAX_BATCH;
+    let i = 0;
+    while (i < todo.length) {
+      signal?.throwIfAborted();
+      let batch = todo.slice(i, i + size);
+      let session: ModelSession | null = null;
+      let prompt = "";
+      try {
+        session = await this.createSession(SYSTEM_PROMPT, signal);
+        prompt = buildPrompt(input, topics, batch);
+        while (batch.length > MIN_BATCH && !(await fits(session, prompt, SCHEMA, batch.length))) {
+          size = Math.max(MIN_BATCH, Math.floor(batch.length * 0.6));
+          batch = todo.slice(i, i + size);
+          prompt = buildPrompt(input, topics, batch);
+        }
+        onModel?.({ kind: "input", items: batch.map((t) => cleanTitle(t.title, t.url)) });
+        const raw = await ask(session, prompt, signal, (text) => onModel?.({ kind: "output", text }));
+        const answers = parseAnswer(raw);
+        const offered = [...topics];
+        batch.forEach((t, k) => {
           const answer = answers.get(k + 1);
-          if (answer === undefined) return;
-          let target = resolveAnswer(answer, input, offered);
-          // A website name is not a topic: fall back to the subject itself.
+          if (!answer) return;
+          let subject = answer.subject.trim().replace(/\s+/g, " ");
+          if (isSiteName(subject, siteLabels)) subject = cleanTitle(t.title, t.url);
+          subject = clip(subject, 60);
+          let target = resolveAnswer(answer.group, input, offered);
+          // A website name is not a topic: fall back to the subject, which still groups identical subjects.
           if (target.kind === "new" && isSiteName(target.name, siteLabels)) target = { kind: "new", name: subject };
           if (target.kind === "new") target = { kind: "new", name: addTopic(target.name) };
-          this.topics.set(normName(subject), target);
+          this.cache.set(tabKey(t), { subject, target });
+          this.lastSubjects.set(t.id, subject);
+          result.set(t.id, target);
         });
-      },
-    );
-
-    const result = new Map<number, SortTarget>();
-    for (const t of input.tabs) {
-      const subject = this.lastSubjects.get(t.id);
-      if (subject === undefined) continue;
-      // Subjects the model gave no topic for can still group with identical subjects.
-      result.set(t.id, this.topics.get(normName(subject)) ?? { kind: "new", name: subject });
+      } catch (e) {
+        if (signal?.aborted) throw e;
+        this.lastError = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+        onModel?.({ kind: "error", text: this.lastError });
+        console.warn("On-device AI couldn't sort a batch of tabs; sorting them by website.", e);
+      } finally {
+        session?.destroy();
+      }
+      i += batch.length;
+      onProgress?.(i, todo.length);
     }
 
     const missing = input.tabs.filter((t) => !result.has(t.id));
@@ -313,43 +301,26 @@ export class NanoSorter implements Sorter {
     for (const [id, v] of result) if (v.kind === "new" && counts.get(normName(v.name))! < 2) result.set(id, { kind: "left" });
     return result;
   }
+}
 
-  /** Sends `items` to the model in batches that fit its context window. Failed batches are skipped. */
-  private async inBatches<T>(
-    items: T[],
-    system: string,
-    schema: object,
-    build: (batch: T[]) => string,
-    signal: AbortSignal | undefined,
-    handle: (batch: T[], raw: string) => void,
-    progress?: (done: number) => void,
-  ): Promise<void> {
-    let size = MAX_BATCH;
-    let i = 0;
-    while (i < items.length) {
-      signal?.throwIfAborted();
-      let batch = items.slice(i, i + size);
-      let session: ModelSession | null = null;
-      try {
-        session = await this.createSession(system, signal);
-        let prompt = build(batch);
-        while (batch.length > MIN_BATCH && !(await fits(session, prompt, schema, batch.length))) {
-          size = Math.max(MIN_BATCH, Math.floor(batch.length * 0.6));
-          batch = items.slice(i, i + size);
-          prompt = build(batch);
-        }
-        handle(batch, await session.prompt(prompt, { responseConstraint: schema, signal }));
-      } catch (e) {
-        if (signal?.aborted) throw e;
-        console.warn("On-device AI couldn't handle a batch; those tabs are sorted by website.", e);
-        this.lastError = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
-      } finally {
-        session?.destroy();
-      }
-      i += batch.length;
-      progress?.(i);
-    }
+/** Prompts the model, streaming the answer to `onText` (the whole answer so far) when the session supports it. */
+async function ask(session: ModelSession, prompt: string, signal: AbortSignal | undefined, onText: (text: string) => void): Promise<string> {
+  const options = { responseConstraint: SCHEMA, signal };
+  if (!session.promptStreaming) {
+    const raw = await session.prompt(prompt, options);
+    onText(raw);
+    return raw;
   }
+  let text = "";
+  const reader = session.promptStreaming(prompt, options).getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    // Older Chrome versions sent the whole answer so far in each chunk; newer ones send only the new part.
+    text = value.startsWith(text) && text ? value : text + value;
+    onText(text);
+  }
+  return text;
 }
 
 async function fits(session: ModelSession, prompt: string, schema: object, count: number): Promise<boolean> {

@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  buildSubjectPrompt,
-  buildTopicPrompt,
+  buildPrompt,
   cleanTitle,
   NanoSorter,
   parseAnswer,
@@ -19,27 +18,39 @@ interface Script {
   topic: (subject: string, groups: Record<string, string>) => string;
 }
 
-/** A fake model that answers both steps from a script, and records every prompt. */
-function fakeModel(script: Script, opts: { window?: number; failSubjects?: boolean } = {}) {
-  const prompts: { kind: "subject" | "topic"; text: string }[] = [];
+/** A fake model that answers from a script, and records every prompt. */
+function fakeModel(script: Script, opts: { window?: number; fail?: boolean; stream?: boolean } = {}) {
+  const prompts: string[] = [];
   let sessions = 0;
+  const answer = (p: string) => {
+    prompts.push(p);
+    if (opts.fail) return "Sure! Here you go.";
+    const groups = Object.fromEntries([...p.matchAll(/^([EUN]\d+): "([^"]*)"/gm)].map((m) => [m[2], m[1]]));
+    const tabs = [...p.matchAll(/^(\d+)\. (.*)$/gm)].map((m) => {
+      const subject = script.subject(m[2]);
+      return { tab: Number(m[1]), subject, group: script.topic(subject, groups) };
+    });
+    return JSON.stringify({ tabs });
+  };
   const factory = async (): Promise<ModelSession> => {
     sessions++;
     return {
       contextWindow: opts.window,
       contextUsage: 0,
       measureContextUsage: async (p: string) => p.length / 4,
-      async prompt(p: string) {
-        const lines = [...p.matchAll(/^(\d+)\. (.*)$/gm)].map((m) => [Number(m[1]), m[2]] as const);
-        if (p.startsWith("Tabs:")) {
-          prompts.push({ kind: "subject", text: p });
-          if (opts.failSubjects) return "Sure! Here you go.";
-          return JSON.stringify({ subjects: lines.map(([n, line]) => ({ tab: n, subject: script.subject(line) })) });
-        }
-        prompts.push({ kind: "topic", text: p });
-        const groups = Object.fromEntries([...p.matchAll(/^([EUN]\d+): "([^"]*)"/gm)].map((m) => [m[2], m[1]]));
-        return JSON.stringify({ assignments: lines.map(([n, s]) => ({ subject: n, group: script.topic(s, groups) })) });
-      },
+      prompt: async (p: string) => answer(p),
+      promptStreaming: opts.stream
+        ? (p: string) => {
+            const text = answer(p);
+            const pieces = text.match(/.{1,7}/gs) ?? [];
+            return new ReadableStream<string>({
+              start(c) {
+                for (const piece of pieces) c.enqueue(piece);
+                c.close();
+              },
+            });
+          }
+        : undefined,
       destroy() {},
     };
   };
@@ -70,15 +81,15 @@ describe("cleanTitle", () => {
 });
 
 describe("parseAnswer", () => {
-  it("reads the list, also inside a code fence", () => {
-    const raw = '```json\n{"assignments":[{"subject":1,"group":"E1"},{"subject":2,"group":"none"}]}\n```';
-    expect([...parseAnswer(raw, "assignments", "subject", "group")]).toEqual([
-      [1, "E1"],
-      [2, "none"],
+  it("reads subjects and groups, also inside a code fence", () => {
+    const raw = '```json\n{"tabs":[{"tab":1,"subject":"React hooks","group":"E1"},{"tab":2,"subject":"Weather","group":"none"}]}\n```';
+    expect([...parseAnswer(raw)]).toEqual([
+      [1, { subject: "React hooks", group: "E1" }],
+      [2, { subject: "Weather", group: "none" }],
     ]);
   });
   it("throws on anything else", () => {
-    expect(() => parseAnswer("Sure! Here are your groups", "assignments", "subject", "group")).toThrow();
+    expect(() => parseAnswer("Sure! Here are your groups")).toThrow();
   });
 });
 
@@ -105,27 +116,30 @@ describe("resolveAnswer", () => {
   });
 });
 
-describe("prompts", () => {
-  it("the subject step sees cleaned titles", () => {
-    const p = buildSubjectPrompt([tab({ url: "https://www.react.dev/a", title: "useEffect – React" })]);
-    expect(p).toContain("1. useEffect (on react.dev)");
-  });
-  it("the topic step sees groups and subjects, but no websites", () => {
-    const p = buildTopicPrompt(
-      input([], {
-        existingGroups: [
-          { group: group({ id: 1, title: "Trip" }), tabs: [tab({ url: "https://booking.com/x", title: "Kyoto ryokan – Booking.com" })] },
-        ],
-        userGroups: [{ id: "u", name: "Reading", hint: "hacker news", color: "pink" }],
-      }),
-      ["Baking"],
-      ["React hooks"],
-    );
+describe("buildPrompt", () => {
+  const p = buildPrompt(
+    {
+      tabs: [],
+      existingGroups: [
+        { group: group({ id: 1, title: "Trip" }), tabs: [tab({ url: "https://booking.com/x", title: "Kyoto ryokan – Booking.com" })] },
+      ],
+      userGroups: [{ id: "u", name: "Reading", hint: "hacker news", color: "pink" }],
+    },
+    ["Baking"],
+    [
+      tab({ url: "https://www.react.dev/a", title: "useEffect – React" }),
+      tab({ url: "https://stackoverflow.com/q/1", title: "Why does useEffect run twice? - Stack Overflow" }),
+    ],
+  );
+  it("lists groups and known topics", () => {
     expect(p).toContain('U1: "Reading" (proposed by the user). Hint: hacker news');
     expect(p).toContain('E1: "Trip" (existing group). It holds: "Kyoto ryokan"');
     expect(p).toContain('N1: "Baking"');
-    expect(p).toContain("1. React hooks");
-    expect(p).not.toMatch(/booking\.com|react\.dev/i);
+  });
+  it("shows cleaned titles, with the website only for very short ones", () => {
+    expect(p).toContain("1. useEffect (on react.dev)");
+    expect(p).toContain("2. Why does useEffect run twice?\n");
+    expect(p).not.toMatch(/booking\.com|stackoverflow/i);
   });
 });
 
@@ -190,36 +204,53 @@ describe("NanoSorter", () => {
     const model = fakeModel(script, { window: 300 });
     const progress: number[] = [];
     const res = await new NanoSorter(model.factory).sort(input(many), { onProgress: (d) => progress.push(d) });
-    expect(model.prompts.filter((p) => p.kind === "subject").length).toBeGreaterThan(1);
+    expect(model.prompts.length).toBeGreaterThan(1);
+    expect(model.prompts.at(-1)).toContain('N1: "Web development"');
     expect(new Set([...res.values()].map((v) => JSON.stringify(v)))).toEqual(
       new Set([JSON.stringify({ kind: "new", name: "Web development" })]),
     );
     expect(progress).toContain(12);
   });
 
-  it("only asks about new tabs, and only re-groups subjects when the groups change", async () => {
+  it("only asks about new tabs until the groups change", async () => {
     const t = tabs();
     const model = fakeModel(script);
     const sorter = new NanoSorter(model.factory);
     await sorter.sort(input(t.slice(0, 3)));
-    expect(model.prompts.map((p) => p.kind)).toEqual(["subject", "topic"]);
-
     await sorter.sort(input(t.slice(0, 4)));
-    expect(model.prompts.map((p) => p.kind)).toEqual(["subject", "topic", "subject", "topic"]);
-    expect(model.prompts[2].text).toContain("1. Dutch ovens, tested");
-    expect(model.prompts[2].text).not.toContain("useEffect");
-    expect(model.prompts[3].text).toContain('N2: "Baking"');
-
+    expect(model.prompts).toHaveLength(2);
+    expect(model.prompts[1]).toContain("1. Dutch ovens, tested");
+    expect(model.prompts[1]).not.toContain("useEffect");
+    expect(model.prompts[1]).toContain('N2: "Baking"');
     await sorter.sort(input(t.slice(0, 4)));
-    expect(model.prompts).toHaveLength(4);
-
+    expect(model.prompts).toHaveLength(2);
     await sorter.sort(input(t.slice(0, 4), { userGroups: [{ id: "u", name: "New", hint: "", color: "red" }] }));
-    expect(model.prompts.map((p) => p.kind).slice(4)).toEqual(["topic"]);
+    expect(model.prompts).toHaveLength(3);
+    expect(model.prompts[2]).toContain("useEffect");
+  });
+
+  it("streams what goes in and out of the model", async () => {
+    const t = tabs().slice(0, 2);
+    const events: string[] = [];
+    const res = await new NanoSorter(fakeModel(script, { stream: true }).factory).sort(input(t), {
+      onModel: (e) => events.push(e.kind === "input" ? `in:${e.items.join("|")}` : `${e.kind}:${e.text.length}`),
+    });
+    expect(events[0]).toBe("in:useEffect|Configuring Vite");
+    expect(events.filter((e) => e.startsWith("output:")).length).toBeGreaterThan(3);
+    expect(res.get(t[0].id)).toEqual({ kind: "new", name: "Web development" });
+  });
+
+  it("reports model errors", async () => {
+    const events: string[] = [];
+    await new NanoSorter(fakeModel(script, { fail: true }).factory).sort(input([tab({ url: "https://a.com/x" })]), {
+      onModel: (e) => events.push(e.kind),
+    });
+    expect(events).toEqual(["input", "output", "error"]);
   });
 
   it("sorts tabs by website when the model fails", async () => {
     const t = [tab({ url: "https://react.dev/a" }), tab({ url: "https://react.dev/b" })];
-    const sorter = new NanoSorter(fakeModel(script, { failSubjects: true }).factory);
+    const sorter = new NanoSorter(fakeModel(script, { fail: true }).factory);
     const res = await sorter.sort(input(t));
     expect(res.get(t[0].id)).toEqual({ kind: "new", name: "react.dev" });
     expect(sorter.lastFallbackCount).toBe(2);

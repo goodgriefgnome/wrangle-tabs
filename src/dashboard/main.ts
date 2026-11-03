@@ -32,7 +32,16 @@ const S = {
   modal: null as null | ((e: KeyboardEvent) => void),
   busy: false,
   /** Progress of a slow (AI) sort, while one is running. */
-  sorting: null as null | { done: number; total: number; phase?: "grouping" },
+  sorting: null as null | {
+    done: number;
+    total: number;
+    /** When the current batch went to the model. */
+    batchStart?: number;
+    /** Titles in the current batch, and the model's answer so far. */
+    input?: string[];
+    output?: string;
+    error?: string;
+  },
   aiStatus: "unsupported" as NanoStatus,
   sorterPref: "ai" as SorterPref,
   /** Model download progress (0..1) while this page is downloading it. */
@@ -276,8 +285,7 @@ function rowHTML(r: Row): string {
 function render() {
   renderSorter();
   if (!S.plan) {
-    const p = S.sorting;
-    listEl.innerHTML = `<div class="row info">${p ? (p.phase ? "Grouping topics with on-device AI…" : `Reading tabs with on-device AI… ${p.done} of ${p.total}`) : "Reading your tabs…"}</div>`;
+    listEl.innerHTML = `<div class="row info">${S.sorting ? "Sorting your tabs with on-device AI. Progress is shown above." : "Reading your tabs…"}</div>`;
     return;
   }
   rows = buildRows(S.plan);
@@ -451,13 +459,20 @@ async function replan() {
       sorter: activeSorter(),
       sortOptions: {
         signal: abort.signal,
-        onProgress: (done, total, phase) => {
+        onProgress: (done, total) => {
           if (!current() || total === 0) return;
-          S.sorting = { done, total, phase };
+          S.sorting = { ...S.sorting, done, total };
           if (S.plan) {
             renderSorter();
             renderSummary();
           } else render();
+        },
+        onModel: (event) => {
+          if (!current() || !S.sorting) return;
+          if (event.kind === "input") Object.assign(S.sorting, { input: event.items, output: "", error: undefined, batchStart: Date.now() });
+          else if (event.kind === "output") S.sorting.output = event.text;
+          else S.sorting.error = event.text;
+          renderBanner();
         },
       },
     });
@@ -476,7 +491,24 @@ async function replan() {
 function renderBanner() {
   const el = $("#aibanner");
   let html = "";
-  if (S.download !== null) {
+  if (S.sorting) {
+    const p = S.sorting;
+    // Tabs the model has finished answering in the current batch, counted from the streamed answer.
+    const answered = Math.min(p.input?.length ?? 0, (p.output?.match(/"group"\s*:\s*"[^"]*"/g) ?? []).length);
+    const done = Math.min(p.total, p.done + answered);
+    const pct = p.total ? Math.round((done / p.total) * 100) : 0;
+    const secs = p.batchStart ? Math.floor((Date.now() - p.batchStart) / 1000) : 0;
+    // Show the end of the answer, where the model is writing right now.
+    const out = p.error ? `failed: ${p.error}` : (p.output ?? "").replace(/\s+/g, " ").slice(-220);
+    html =
+      `<div class="aibanner-text"><strong>Sorting with on-device AI… ${done} of ${p.total} tabs</strong>` +
+      `<span>${p.input ? `This batch: ${p.input.length} tabs, ${secs} s so far` : "Starting the model…"}</span></div>` +
+      `<div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><div style="width:${pct}%"></div></div>` +
+      (p.input
+        ? `<div class="modelio"><div><span class="dir">in</span><span class="txt">${esc(p.input.join(" · "))}</span></div>` +
+          `<div><span class="dir">out</span><span class="txt tail${p.error ? " err" : ""}"><span>${esc(out) || "…"}</span></span></div></div>`
+        : "");
+  } else if (S.download !== null) {
     const pct = Math.round(S.download * 100);
     html =
       `<div class="aibanner-text"><strong>Downloading Chrome's on-device AI model… ${pct}%</strong>` +
@@ -500,6 +532,11 @@ function renderBanner() {
   el.hidden = !html;
 }
 
+// Keeps the "so far" seconds counting while the model works on a batch.
+setInterval(() => {
+  if (S.sorting?.batchStart) renderBanner();
+}, 1000);
+
 $("#aibanner").addEventListener("click", (e) => {
   if ((e.target as HTMLElement).closest("[data-act=download]")) void startDownload();
 });
@@ -510,9 +547,7 @@ function renderSorter() {
   const button = (act: string, label: string, title = "") =>
     `<button type="button" class="link" data-act="${act}"${title ? ` title="${esc(title)}"` : ""}>${label}</button>`;
   if (S.sorting) {
-    el.innerHTML = S.sorting.phase
-      ? "Grouping topics with on-device AI…"
-      : `Reading tabs with on-device AI… ${S.sorting.done} of ${S.sorting.total}`;
+    el.innerHTML = "Sorting with on-device AI…";
     return;
   }
   if (S.download !== null) {

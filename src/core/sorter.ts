@@ -17,11 +17,18 @@ export type SortTarget =
  * Decides where each ungrouped tab should go. Stage 1 ships SiteSorter;
  * stage 2 adds a Gemini Nano sorter behind the same interface.
  */
+export type ModelEvent =
+  | { kind: "input"; items: string[] }
+  | { kind: "output"; text: string }
+  | { kind: "error"; text: string };
+
 export interface SortOptions {
   /** Aborted when a newer sort supersedes this one. */
   signal?: AbortSignal;
   /** Called as tabs get sorted, for slow sorters. `phase` names a step that has no count. */
   onProgress?: (done: number, total: number, phase?: "grouping") => void;
+  /** What a model-based sorter is sending and receiving right now, for display. */
+  onModel?: (event: ModelEvent) => void;
 }
 
 export interface Sorter {

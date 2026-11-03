@@ -140,3 +140,12 @@ button.link:focus-visible { outline: 2px solid var(--cursor-edge); outline-offse
 .aibanner-text span { color: var(--muted); font-size: 13px; }
 .aibanner .bar { flex-basis: 100%; height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
 .aibanner .bar div { height: 100%; background: var(--accent); transition: width 200ms; }
+
+.modelio { flex-basis: 100%; min-width: 0; display: flex; flex-direction: column; gap: 3px; font-family: var(--font-mono); font-size: 11.5px; }
+.modelio > div { display: flex; gap: 8px; min-width: 0; }
+.modelio .dir { flex: none; width: 2.5em; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.modelio .txt { min-width: 0; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Cut the start, not the end: the newest output is on the right. */
+.modelio .txt.tail { display: flex; justify-content: flex-end; text-overflow: clip; }
+.modelio .txt.tail > span { flex: none; white-space: nowrap; }
+.modelio .txt.err { color: var(--danger); }
