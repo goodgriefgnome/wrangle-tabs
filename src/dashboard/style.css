@@ -149,3 +149,18 @@ button.link:focus-visible { outline: 2px solid var(--cursor-edge); outline-offse
 .modelio .txt.tail { display: flex; justify-content: flex-end; text-overflow: clip; }
 .modelio .txt.tail > span { flex: none; white-space: nowrap; }
 .modelio .txt.err { color: var(--danger); }
+
+.settings { display: flex; flex-direction: column; gap: 10px; }
+.choice { display: flex; gap: 10px; align-items: flex-start; cursor: pointer; }
+.choice input { margin-top: 3px; }
+.choice span { display: flex; flex-direction: column; gap: 2px; }
+.choice small { color: var(--muted); font-size: 12.5px; }
+.choice a { color: var(--accent); }
+.fields { display: flex; flex-direction: column; gap: 6px; padding-left: 26px; }
+.field { display: grid; grid-template-columns: 70px 1fr; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); }
+.dialog .field input { border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font-family: var(--font-mono); font-size: 12.5px; }
+.dialog .field input:focus { outline: 2px solid var(--cursor-edge); outline-offset: -1px; }
+.settings .error { color: var(--danger); margin: 0; font-size: 13px; }
+[hidden] { display: none !important; }
+.dialog .choice input { width: auto; flex: none; padding: 0; border: 0; margin: 3px 0 0; }
+.dialog .choice input:focus { background: none; outline: 2px solid var(--cursor-edge); outline-offset: 2px; }

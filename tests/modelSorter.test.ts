@@ -2,11 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   buildPrompt,
   cleanTitle,
-  NanoSorter,
+  ModelSorter,
   parseAnswer,
   resolveAnswer,
-  type ModelSession,
-} from "../src/core/nanoSorter";
+} from "../src/core/modelSorter";
+import type { Model } from "../src/core/model";
 import type { SortInput } from "../src/core/sorter";
 import type { TabInfo } from "../src/core/types";
 import { group, tab } from "./helpers";
@@ -32,29 +32,23 @@ function fakeModel(script: Script, opts: { window?: number; fail?: boolean; stre
     });
     return JSON.stringify({ tabs });
   };
-  const factory = async (): Promise<ModelSession> => {
-    sessions++;
-    return {
-      contextWindow: opts.window,
-      contextUsage: 0,
-      measureContextUsage: async (p: string) => p.length / 4,
-      prompt: async (p: string) => answer(p),
-      promptStreaming: opts.stream
-        ? (p: string) => {
-            const text = answer(p);
-            const pieces = text.match(/.{1,7}/gs) ?? [];
-            return new ReadableStream<string>({
-              start(c) {
-                for (const piece of pieces) c.enqueue(piece);
-                c.close();
-              },
-            });
-          }
-        : undefined,
-      destroy() {},
-    };
+  const model: Model = {
+    name: "fake model",
+    maxBatch: 30,
+    contextTokens: opts.window ?? 100_000,
+    measure: async (r) => r.prompt.length / 4,
+    async complete(r) {
+      sessions++;
+      r.signal?.throwIfAborted();
+      const text = answer(r.prompt);
+      if (opts.stream) {
+        let sofar = "";
+        for (const piece of text.match(/.{1,7}/gs) ?? []) r.onText?.((sofar += piece));
+      } else r.onText?.(text);
+      return text;
+    },
   };
-  return { factory, prompts, sessions: () => sessions };
+  return { model, prompts, sessions: () => sessions };
 }
 
 const input = (tabs: TabInfo[], extra: Partial<SortInput> = {}): SortInput => ({
@@ -174,7 +168,7 @@ describe("NanoSorter", () => {
   it("groups by subject, across websites", async () => {
     const t = tabs();
     const model = fakeModel(script);
-    const sorter = new NanoSorter(model.factory);
+    const sorter = new ModelSorter(model.model);
     const res = await sorter.sort(input(t));
     expect(res.get(t[0].id)).toEqual({ kind: "new", name: "Web development" });
     expect(res.get(t[1].id)).toEqual({ kind: "new", name: "Web development" });
@@ -192,7 +186,7 @@ describe("NanoSorter", () => {
       tab({ url: "https://reddit.com/r/mk/1", title: "Mechanical keyboards for beginners - Reddit" }),
       tab({ url: "https://theverge.com/k", title: "Mechanical keyboard review" }),
     ];
-    const res = await new NanoSorter(fakeModel(script).factory).sort(
+    const res = await new ModelSorter(fakeModel(script).model).sort(
       input(t, { userGroups: [{ id: "r", name: "Reading", hint: "", color: "pink" }] }),
     );
     expect(res.get(t[0].id)).toEqual({ kind: "user", id: "r" });
@@ -203,7 +197,7 @@ describe("NanoSorter", () => {
     const many = Array.from({ length: 12 }, (_, i) => tab({ url: `https://site${i}.com/`, title: `useEffect part ${i}` }));
     const model = fakeModel(script, { window: 300 });
     const progress: number[] = [];
-    const res = await new NanoSorter(model.factory).sort(input(many), { onProgress: (d) => progress.push(d) });
+    const res = await new ModelSorter(model.model).sort(input(many), { onProgress: (d) => progress.push(d) });
     expect(model.prompts.length).toBeGreaterThan(1);
     expect(model.prompts.at(-1)).toContain('N1: "Web development"');
     expect(new Set([...res.values()].map((v) => JSON.stringify(v)))).toEqual(
@@ -215,7 +209,7 @@ describe("NanoSorter", () => {
   it("only asks about new tabs until the groups change", async () => {
     const t = tabs();
     const model = fakeModel(script);
-    const sorter = new NanoSorter(model.factory);
+    const sorter = new ModelSorter(model.model);
     await sorter.sort(input(t.slice(0, 3)));
     await sorter.sort(input(t.slice(0, 4)));
     expect(model.prompts).toHaveLength(2);
@@ -232,7 +226,7 @@ describe("NanoSorter", () => {
   it("streams what goes in and out of the model", async () => {
     const t = tabs().slice(0, 2);
     const events: string[] = [];
-    const res = await new NanoSorter(fakeModel(script, { stream: true }).factory).sort(input(t), {
+    const res = await new ModelSorter(fakeModel(script, { stream: true }).model).sort(input(t), {
       onModel: (e) => events.push(e.kind === "input" ? `in:${e.items.join("|")}` : `${e.kind}:${e.text.length}`),
     });
     expect(events[0]).toBe("in:useEffect|Configuring Vite");
@@ -242,7 +236,7 @@ describe("NanoSorter", () => {
 
   it("reports model errors", async () => {
     const events: string[] = [];
-    await new NanoSorter(fakeModel(script, { fail: true }).factory).sort(input([tab({ url: "https://a.com/x" })]), {
+    await new ModelSorter(fakeModel(script, { fail: true }).model).sort(input([tab({ url: "https://a.com/x" })]), {
       onModel: (e) => events.push(e.kind),
     });
     expect(events).toEqual(["input", "output", "error"]);
@@ -250,7 +244,7 @@ describe("NanoSorter", () => {
 
   it("sorts tabs by website when the model fails", async () => {
     const t = [tab({ url: "https://react.dev/a" }), tab({ url: "https://react.dev/b" })];
-    const sorter = new NanoSorter(fakeModel(script, { fail: true }).factory);
+    const sorter = new ModelSorter(fakeModel(script, { fail: true }).model);
     const res = await sorter.sort(input(t));
     expect(res.get(t[0].id)).toEqual({ kind: "new", name: "react.dev" });
     expect(sorter.lastFallbackCount).toBe(2);
@@ -260,7 +254,7 @@ describe("NanoSorter", () => {
     const abort = new AbortController();
     abort.abort();
     const model = fakeModel(script);
-    await expect(new NanoSorter(model.factory).sort(input([tab({ url: "https://a.com" })]), { signal: abort.signal })).rejects.toThrow();
+    await expect(new ModelSorter(model.model).sort(input([tab({ url: "https://a.com" })]), { signal: abort.signal })).rejects.toThrow();
     expect(model.sessions()).toBe(0);
   });
 });

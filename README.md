@@ -35,13 +35,18 @@ Pinned tabs never appear on the dashboard and are never moved.
 
 ## Sorting
 
-Tabs are sorted by Chrome's built-in AI model (Gemini Nano), which runs on your computer: your tabs are never sent anywhere. For each ungrouped tab, the model writes a short subject and then picks one of your groups or a topic, seeing the tab's title (with the site name removed), your existing groups and the groups you proposed. Topics that are just a website name are rejected, and a topic with only one tab goes to the Leftovers window. While it works, the dashboard shows a progress bar and what goes in and out of the model.
+An AI model groups tabs by subject. For each ungrouped tab, it writes a short subject and then picks one of your groups or a topic, seeing the tab's title (with the site name removed), your existing groups and the groups you proposed. Topics that are just a website name are rejected, and a topic with only one tab goes to the Leftovers window. While it works, the dashboard shows a progress bar and what goes in and out of the model.
 
-The first time, click **Use on-device AI** at the top right of the dashboard to download the model (a one-time download of a few GB). Chrome's requirements: Chrome 138 or later on Windows, macOS, Linux or a Chromebook Plus, 22 GB of free disk space, and either a GPU with more than 4 GB of video memory or 16 GB of RAM. `chrome://on-device-internals` shows the model's status.
+Choose the model in **AI settings** (top right, or press `s`):
 
-Where the model isn't available, or after **Sort by website instead**, tabs are sorted by website: your proposed groups first (by matching words in their name and hint), then the existing group that already holds tabs from the same site, then a new group per site with two or more tabs.
+- **Chrome's built-in AI** (Gemini Nano), the default. It runs on your computer, so your tabs are never sent anywhere. It needs a one-time download of a few GB (the dashboard offers it), Chrome 138 or later on Windows, macOS, Linux or a Chromebook Plus, 22 GB of free disk space, and either a GPU with more than 4 GB of video memory or 16 GB of RAM. `chrome://on-device-internals` shows its status.
+- **Gemini API**, Google's online model, with a free tier. Get a key at [aistudio.google.com/apikey](https://aistudio.google.com/apikey). Tab titles are sent to Google, which may use free-tier data to improve its products.
+- **OpenAI-compatible API**: OpenRouter, Groq, a local Ollama or LM Studio, and other services that accept OpenAI's chat-completions format. Tab titles are sent to that service.
+- **No AI**: tabs are sorted by website. Your proposed groups are filled first, by matching words in their name and hint, then the existing group that already holds tabs from the same site, then a new group per site with two or more tabs.
 
-Sorting with the model takes a few seconds per batch of tabs; the dashboard shows progress and can't apply changes until it's done. Answers are remembered per tab, so re-scans only ask about tabs that are new, until your groups change.
+API keys are stored only in this browser and are never synced. The extension asks for permission to reach an online model's website when you choose it.
+
+If the AI fails on some tabs, they're sorted by website, and the status line at the bottom says why. Answers are remembered per tab, so re-scans only ask about tabs that are new, until your groups change.
 
 ## Keys
 
@@ -62,6 +67,7 @@ Sorting with the model takes a few seconds per batch of tabs; the dashboard show
 | `y` | Copy the tab's full URL |
 | `/` | Filter |
 | `r` | Re-scan tabs |
+| `s` | AI settings |
 | Shift+Enter | Apply ticked changes |
 | `?` | All shortcuts |
 
@@ -79,7 +85,8 @@ To load a local build, follow the install steps above with the `dist/` folder. A
 
 ### Layout
 
-- `src/core/` — pure logic, no Chrome APIs: URL cleanup, duplicate detection, the sorters and the plan builder. Covered by `tests/` (the AI sorter is tested against a scripted fake model).
-- `src/chrome/` — reading tabs, applying changes, storage, and the Prompt API (`nano.ts`).
+- `src/core/` — pure logic, no Chrome APIs: URL cleanup, duplicate detection, the sorters and the plan builder. `model.ts` is the interface every AI model implements. Covered by `tests/` (the AI sorter is tested against a scripted fake model).
+- `src/chrome/` — reading tabs, applying changes, storage, and AI settings (`aiSettings.ts`).
+- `src/chrome/models/` — one file per way of reaching a model: Chrome's built-in AI, the Gemini API, OpenAI-compatible APIs. To add another, implement `Model` there and add it to `aiSettings.ts` and the settings dialog.
 - `src/dashboard/` — the dashboard page.
 - `src/background.ts` — opens or focuses the dashboard.

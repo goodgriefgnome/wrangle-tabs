@@ -1,21 +1,8 @@
+import { estimateTokens, type Model, type ModelRequest } from "./model";
 import { SiteSorter } from "./siteSorter";
 import type { Sorter, SortInput, SortOptions, SortTarget } from "./sorter";
 import type { TabInfo } from "./types";
 import { siteOf } from "./url";
-
-/** The parts of a Prompt API session the sorter uses. */
-export interface ModelSession {
-  prompt(input: string, options?: { responseConstraint?: object; signal?: AbortSignal }): Promise<string>;
-  /** Streams the answer in pieces. Used when available, so the dashboard can show it as it arrives. */
-  promptStreaming?(input: string, options?: { responseConstraint?: object; signal?: AbortSignal }): ReadableStream<string>;
-  measureContextUsage?(input: string, options?: { responseConstraint?: object }): Promise<number>;
-  readonly contextUsage?: number;
-  readonly contextWindow?: number;
-  destroy(): void;
-}
-
-/** Creates a fresh session that already has the given system prompt. */
-export type SessionFactory = (systemPrompt: string, signal?: AbortSignal) => Promise<ModelSession>;
 
 export const SYSTEM_PROMPT = `You sort web browser tabs into tab groups by subject.
 You get a numbered list of groups and a numbered list of tabs. For every tab, first write its subject: what the page is about, in 2 to 5 words. Then pick its group:
@@ -41,7 +28,6 @@ const SCHEMA = {
   required: ["tabs"],
 };
 
-const MAX_BATCH = 30;
 const MIN_BATCH = 3;
 /** Rough number of tokens the answer uses per item. */
 const OUTPUT_TOKENS_PER_ITEM = 30;
@@ -182,16 +168,16 @@ export function resolveAnswer(answer: string, input: SortInput, topics: string[]
  * - Tabs the model fails on are sorted by website.
 
 /**
- * Sorts tabs with Chrome's built-in model (Gemini Nano). For each tab the model
- * writes a subject and then picks a group, in one answer.
+ * Sorts tabs with a language model (see ./model.ts for the models it can use).
+ * For each tab the model writes a subject and then picks a group, in one answer.
  * - Tabs go to the model in batches that fit its context window. Topic names
  *   from earlier batches are offered to later ones, so topics stay consistent.
  * - Answers are remembered per tab until the groups change, so re-scans only ask about new tabs.
  * - Website names are rejected as topics; a topic with a single tab goes to Leftovers.
  * - Tabs the model fails on are sorted by website.
  */
-export class NanoSorter implements Sorter {
-  readonly label = "Sorted by on-device AI";
+export class ModelSorter implements Sorter {
+  readonly label: string;
   /** Tabs the model failed on in the last sort, which were sorted by website instead. */
   lastFallbackCount = 0;
   /** The last error from the model in the last sort, if any. */
@@ -201,9 +187,11 @@ export class NanoSorter implements Sorter {
   private lastSubjects = new Map<number, string>();
 
   constructor(
-    private readonly createSession: SessionFactory,
+    readonly model: Model,
     private readonly fallback: Sorter = new SiteSorter(),
-  ) {}
+  ) {
+    this.label = `Sorted by ${model.name}`;
+  }
 
   /** What the model said the tab is about, from the last sort. */
   subjectOf(tabId: number): string | undefined {
@@ -243,23 +231,21 @@ export class NanoSorter implements Sorter {
     for (const v of result.values()) if (v.kind === "new") addTopic(v.name);
 
     onProgress?.(0, todo.length);
-    let size = MAX_BATCH;
+    let size = this.model.maxBatch;
     let i = 0;
     while (i < todo.length) {
       signal?.throwIfAborted();
       let batch = todo.slice(i, i + size);
-      let session: ModelSession | null = null;
-      let prompt = "";
       try {
-        session = await this.createSession(SYSTEM_PROMPT, signal);
-        prompt = buildPrompt(input, topics, batch);
-        while (batch.length > MIN_BATCH && !(await fits(session, prompt, SCHEMA, batch.length))) {
+        const request = (prompt: string): ModelRequest => ({ system: SYSTEM_PROMPT, prompt, schema: SCHEMA, signal });
+        let prompt = buildPrompt(input, topics, batch);
+        while (batch.length > MIN_BATCH && !(await fits(this.model, request(prompt), batch.length))) {
           size = Math.max(MIN_BATCH, Math.floor(batch.length * 0.6));
           batch = todo.slice(i, i + size);
           prompt = buildPrompt(input, topics, batch);
         }
         onModel?.({ kind: "input", items: batch.map((t) => cleanTitle(t.title, t.url)) });
-        const raw = await ask(session, prompt, signal, (text) => onModel?.({ kind: "output", text }));
+        const raw = await this.model.complete({ ...request(prompt), onText: (text) => onModel?.({ kind: "output", text }) });
         const answers = parseAnswer(raw);
         const offered = [...topics];
         batch.forEach((t, k) => {
@@ -280,9 +266,7 @@ export class NanoSorter implements Sorter {
         if (signal?.aborted) throw e;
         this.lastError = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
         onModel?.({ kind: "error", text: this.lastError });
-        console.warn("On-device AI couldn't sort a batch of tabs; sorting them by website.", e);
-      } finally {
-        session?.destroy();
+        console.warn(`${this.model.name} couldn't sort a batch of tabs; sorting them by website.`, e);
       }
       i += batch.length;
       onProgress?.(i, todo.length);
@@ -303,29 +287,8 @@ export class NanoSorter implements Sorter {
   }
 }
 
-/** Prompts the model, streaming the answer to `onText` (the whole answer so far) when the session supports it. */
-async function ask(session: ModelSession, prompt: string, signal: AbortSignal | undefined, onText: (text: string) => void): Promise<string> {
-  const options = { responseConstraint: SCHEMA, signal };
-  if (!session.promptStreaming) {
-    const raw = await session.prompt(prompt, options);
-    onText(raw);
-    return raw;
-  }
-  let text = "";
-  const reader = session.promptStreaming(prompt, options).getReader();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    // Older Chrome versions sent the whole answer so far in each chunk; newer ones send only the new part.
-    text = value.startsWith(text) && text ? value : text + value;
-    onText(text);
-  }
-  return text;
-}
-
-async function fits(session: ModelSession, prompt: string, schema: object, count: number): Promise<boolean> {
-  const window = session.contextWindow;
-  if (!window || !session.measureContextUsage) return true;
-  const need = await session.measureContextUsage(prompt, { responseConstraint: schema });
-  return (session.contextUsage ?? 0) + need + count * OUTPUT_TOKENS_PER_ITEM <= window * 0.9;
+/** Whether a request and its answer fit in the model's context. */
+async function fits(model: Model, request: ModelRequest, count: number): Promise<boolean> {
+  const need = model.measure ? await model.measure(request) : estimateTokens(request.system + request.prompt + JSON.stringify(request.schema));
+  return need + count * OUTPUT_TOKENS_PER_ITEM <= model.contextTokens * 0.9;
 }

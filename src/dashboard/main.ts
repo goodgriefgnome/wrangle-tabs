@@ -1,9 +1,10 @@
 import "./style.css";
 import { applyActions, switchToTab, type Actions } from "../chrome/apply";
 import { takeSnapshot } from "../chrome/snapshot";
-import { downloadNano, nanoSessionFactory, nanoStatus, type NanoStatus } from "../chrome/nano";
-import { loadState, saveLeftoversWindowId, saveSorterPref, saveUserGroups, type SorterPref } from "../chrome/storage";
-import { NanoSorter } from "../core/nanoSorter";
+import { hasPermission, missingSetting, modelFor, requestPermission, type AiChoice, type AiSettings, DEFAULT_AI_SETTINGS } from "../chrome/aiSettings";
+import { chromeAiStatus, downloadChromeAi, type ChromeAiStatus } from "../chrome/models/chromeAi";
+import { loadState, saveAiSettings, saveLeftoversWindowId, saveUserGroups } from "../chrome/storage";
+import { ModelSorter } from "../core/modelSorter";
 import { buildPlan, type ManualTarget, type NewGroupPlan, type Plan } from "../core/plan";
 import { SiteSorter } from "../core/siteSorter";
 import type { Sorter } from "../core/sorter";
@@ -12,7 +13,8 @@ import { GROUP_COLORS, type GroupColor, type GroupInfo, type Snapshot, type TabI
 /* ---------------------------------------------------------------- state */
 
 const siteSorter = new SiteSorter();
-const nanoSorter = new NanoSorter(nanoSessionFactory(), siteSorter);
+/** The AI sorter for the current settings; rebuilt when they change, which also drops its remembered answers. */
+let modelSorter: ModelSorter | null = null;
 
 const S = {
   snapshot: null as Snapshot | null,
@@ -42,8 +44,11 @@ const S = {
     output?: string;
     error?: string;
   },
-  aiStatus: "unsupported" as NanoStatus,
-  sorterPref: "ai" as SorterPref,
+  ai: DEFAULT_AI_SETTINGS as AiSettings,
+  /** Whether Chrome's built-in AI is ready, for the "chrome" choice. */
+  aiStatus: "unsupported" as ChromeAiStatus,
+  /** Whether the extension may reach the online model's website, for online choices. */
+  aiAllowed: true,
   /** Model download progress (0..1) while this page is downloading it. */
   download: null as number | null,
 };
@@ -285,7 +290,7 @@ function rowHTML(r: Row): string {
 function render() {
   renderSorter();
   if (!S.plan) {
-    listEl.innerHTML = `<div class="row info">${S.sorting ? "Sorting your tabs with on-device AI. Progress is shown above." : "Reading your tabs…"}</div>`;
+    listEl.innerHTML = `<div class="row info">${S.sorting ? "Sorting your tabs with AI. Progress is shown above." : "Reading your tabs…"}</div>`;
     return;
   }
   rows = buildRows(S.plan);
@@ -395,21 +400,32 @@ function renderStatusLine() {
   el.innerHTML = html;
 }
 
-/** One line on how the current tab was sorted, for checking the AI's work. */
-function sortExplanation(tabId: number): string {
-  if (activeSorter() !== nanoSorter) {
-    const why: Record<NanoStatus, string> = {
-      available: "on-device AI is switched off",
+/** Why sorting falls back to websites with the current AI settings, or null when the AI is in use. */
+function whyNoAi(): string | null {
+  if (S.ai.choice === "site") return "AI is switched off in AI settings";
+  if (S.ai.choice === "chrome") {
+    const why: Record<ChromeAiStatus, string | null> = {
+      available: null,
       downloadable: "the on-device AI model isn't downloaded yet",
       downloading: "the on-device AI model is still downloading",
       unavailable: "Chrome says on-device AI isn't available on this computer",
       unsupported: "this Chrome has no on-device AI (needs Chrome 138 or later)",
     };
-    return `Sorted by website: ${why[S.aiStatus]}.`;
+    return why[S.aiStatus];
   }
-  const subject = nanoSorter.subjectOf(tabId);
+  const missing = missingSetting(S.ai);
+  if (missing) return `AI settings are missing ${missing}`;
+  if (!S.aiAllowed) return "the extension isn't allowed to reach the AI's website yet";
+  return null;
+}
+
+/** One line on how the current tab was sorted, for checking the AI's work. */
+function sortExplanation(tabId: number): string {
+  const sorter = activeSorter();
+  if (!(sorter instanceof ModelSorter)) return `Sorted by website: ${whyNoAi()}.`;
+  const subject = sorter.subjectOf(tabId);
   if (!subject) {
-    const err = nanoSorter.lastError;
+    const err = sorter.lastError;
     return `AI: no answer for this tab, so it was sorted by website.${err ? ` Error: ${err}` : ""}`;
   }
   return `AI: about “${subject}”`;
@@ -436,7 +452,12 @@ async function rescan() {
 }
 
 function activeSorter(): Sorter {
-  return S.sorterPref === "ai" && S.aiStatus === "available" ? nanoSorter : siteSorter;
+  if (whyNoAi()) return siteSorter;
+  if (!modelSorter) {
+    const model = modelFor(S.ai);
+    modelSorter = model ? new ModelSorter(model, siteSorter) : null;
+  }
+  return modelSorter ?? siteSorter;
 }
 
 let replanGeneration = 0;
@@ -487,10 +508,13 @@ async function replan() {
   render();
 }
 
-/** A prominent notice above the list while tabs are sorted by website only because the AI isn't ready. */
+/** A prominent notice above the list: AI progress, or why tabs are only grouped by website. */
 function renderBanner() {
   const el = $("#aibanner");
   let html = "";
+  let muted = false;
+  const sorter = activeSorter();
+  const name = sorter instanceof ModelSorter ? sorter.model.name : "AI";
   if (S.sorting) {
     const p = S.sorting;
     // Tabs the model has finished answering in the current batch, counted from the streamed answer.
@@ -501,7 +525,7 @@ function renderBanner() {
     // Show the end of the answer, where the model is writing right now.
     const out = p.error ? `failed: ${p.error}` : (p.output ?? "").replace(/\s+/g, " ").slice(-220);
     html =
-      `<div class="aibanner-text"><strong>Sorting with on-device AI… ${done} of ${p.total} tabs</strong>` +
+      `<div class="aibanner-text"><strong>Sorting with ${esc(name)}… ${done} of ${p.total} tabs</strong>` +
       `<span>${p.input ? `This batch: ${p.input.length} tabs, ${secs} s so far` : "Starting the model…"}</span></div>` +
       `<div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><div style="width:${pct}%"></div></div>` +
       (p.input
@@ -514,20 +538,27 @@ function renderBanner() {
       `<div class="aibanner-text"><strong>Downloading Chrome's on-device AI model… ${pct}%</strong>` +
       `<span>Tabs stay grouped by website until it finishes. You can keep using this page meanwhile.</span></div>` +
       `<div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><div style="width:${pct}%"></div></div>`;
-  } else if (S.sorterPref === "ai" && (S.aiStatus === "downloadable" || S.aiStatus === "downloading")) {
+  } else if (S.ai.choice === "chrome" && (S.aiStatus === "downloadable" || S.aiStatus === "downloading")) {
     html =
       `<div class="aibanner-text"><strong>Tabs are grouped by website for now</strong>` +
-      `<span>Download Chrome's on-device AI model to group them by subject instead. It's a one-time download of a few GB. It runs on this computer, and your tabs are never sent anywhere.</span></div>` +
+      `<span>Download Chrome's on-device AI model to group them by subject instead. It's a one-time download of a few GB. It runs on this computer, and your tabs are never sent anywhere. Or use an online model in AI settings.</span></div>` +
+      `<button type="button" data-act="settings">AI settings</button>` +
       `<button type="button" class="primary" data-act="download">${S.aiStatus === "downloading" ? "Finish downloading" : "Download AI model"}</button>`;
-  } else if (S.sorterPref === "ai" && (S.aiStatus === "unavailable" || S.aiStatus === "unsupported")) {
+  } else if (S.ai.choice === "chrome" && (S.aiStatus === "unavailable" || S.aiStatus === "unsupported")) {
+    muted = true;
     html =
       `<div class="aibanner-text"><strong>Tabs are grouped by website</strong><span>` +
       (S.aiStatus === "unsupported"
-        ? "Grouping by subject uses Chrome's on-device AI, which needs Chrome 138 or later."
-        : "Grouping by subject uses Chrome's on-device AI, and Chrome says it isn't available on this computer. It needs 22 GB of free disk space and either a GPU with more than 4 GB of video memory or 16 GB of RAM. chrome://on-device-internals shows the details.") +
-      `</span></div>`;
+        ? "Chrome's on-device AI needs Chrome 138 or later."
+        : "Chrome says its on-device AI isn't available on this computer. It needs 22 GB of free disk space and either a GPU with more than 4 GB of video memory or 16 GB of RAM. chrome://on-device-internals shows the details.") +
+      ` You can use an online model instead.</span></div><button type="button" data-act="settings">AI settings</button>`;
+  } else if ((S.ai.choice === "gemini" || S.ai.choice === "openai") && whyNoAi()) {
+    html =
+      `<div class="aibanner-text"><strong>Tabs are grouped by website for now</strong><span>Because ${esc(whyNoAi()!)}.</span></div>` +
+      (missingSetting(S.ai) ? "" : `<button type="button" class="primary" data-act="allow">Allow</button>`) +
+      `<button type="button" data-act="settings">AI settings</button>`;
   }
-  if (html) el.classList.toggle("muted", S.aiStatus === "unavailable" || S.aiStatus === "unsupported");
+  el.classList.toggle("muted", muted);
   el.innerHTML = html;
   el.hidden = !html;
 }
@@ -537,52 +568,48 @@ setInterval(() => {
   if (S.sorting?.batchStart) renderBanner();
 }, 1000);
 
-$("#aibanner").addEventListener("click", (e) => {
-  if ((e.target as HTMLElement).closest("[data-act=download]")) void startDownload();
-});
+function onAiAction(e: Event) {
+  const act = (e.target as HTMLElement).closest<HTMLElement>("[data-act]")?.dataset.act;
+  if (act === "download") void startDownload();
+  else if (act === "settings") openAiSettings();
+  else if (act === "allow") void allowAi();
+}
+$("#aibanner").addEventListener("click", onAiAction);
+$("#sorter").addEventListener("click", onAiAction);
 
 function renderSorter() {
   renderBanner();
   const el = $("#sorter");
-  const button = (act: string, label: string, title = "") =>
-    `<button type="button" class="link" data-act="${act}"${title ? ` title="${esc(title)}"` : ""}>${label}</button>`;
+  const settings = `<button type="button" class="link" data-act="settings">AI settings</button>`;
+  const sorter = activeSorter();
   if (S.sorting) {
-    el.innerHTML = "Sorting with on-device AI…";
-    return;
-  }
-  if (S.download !== null) {
+    el.innerHTML = `Sorting with ${esc(sorter instanceof ModelSorter ? sorter.model.name : "AI")}…`;
+  } else if (S.download !== null) {
     el.innerHTML = `Downloading the AI model… ${Math.round(S.download * 100)}%`;
-    return;
+  } else if (sorter instanceof ModelSorter) {
+    const fb = sorter.lastFallbackCount;
+    const err = sorter.lastError;
+    el.innerHTML = `${esc(sorter.label)}${fb ? ` <span${err ? ` title="${esc(err)}"` : ""}>(${fb} by website, the AI failed on them)</span>` : ""} · ${settings}`;
+  } else {
+    el.innerHTML = `Sorted by website · ${settings}`;
   }
-  if (activeSorter() === nanoSorter) {
-    const fb = nanoSorter.lastFallbackCount;
-    const err = nanoSorter.lastError;
-    el.innerHTML = `Sorted by on-device AI${fb ? ` <span${err ? ` title="${esc(err)}"` : ""}>(${fb} by website, the AI failed on them)</span>` : ""} · ${button("site", "Sort by website instead")}`;
-    return;
-  }
-  const why: Record<NanoStatus, string> = {
-    available: button("ai", "Use on-device AI"),
-    downloadable: button(
-      "download",
-      "Use on-device AI",
-      "Downloads Chrome's built-in model (Gemini Nano) once. It runs on this computer; your tabs are never sent anywhere.",
-    ),
-    downloading: button("download", "Use on-device AI (download in progress)"),
-    unavailable: "On-device AI isn't available on this computer.",
-    unsupported: "On-device AI needs Chrome 138 or later.",
-  };
-  el.innerHTML = `Sorted by website · ${why[S.aiStatus]}`;
 }
 
-$("#sorter").addEventListener("click", (e) => {
-  const act = (e.target as HTMLElement).closest<HTMLElement>("[data-act]")?.dataset.act;
-  if (act === "site" || act === "ai") void setSorterPref(act);
-  else if (act === "download") void startDownload();
-});
+/** Applies new AI settings and re-sorts. */
+async function setAiSettings(ai: AiSettings) {
+  S.ai = ai;
+  modelSorter = null;
+  await saveAiSettings(ai);
+  S.aiAllowed = await hasPermission(ai);
+  if (ai.choice === "chrome") S.aiStatus = await chromeAiStatus();
+  renderSorter();
+  await replan();
+}
 
-async function setSorterPref(pref: SorterPref) {
-  S.sorterPref = pref;
-  await saveSorterPref(pref);
+async function allowAi() {
+  S.aiAllowed = await requestPermission(S.ai);
+  if (!S.aiAllowed) toast("Without that permission, tabs stay grouped by website.");
+  modelSorter = null;
   renderSorter();
   await replan();
 }
@@ -591,22 +618,97 @@ async function setSorterPref(pref: SorterPref) {
 async function startDownload(resume = false) {
   S.download = 0;
   // Start the download first: Chrome only allows it straight after a click.
-  const done = downloadNano((f) => {
+  const done = downloadChromeAi((f) => {
     S.download = f;
     renderSorter();
   });
   renderSorter();
   try {
     await done;
-    S.aiStatus = await nanoStatus();
     S.download = null;
-    await setSorterPref("ai");
+    await setAiSettings({ ...S.ai, choice: "chrome" });
   } catch (e) {
     S.download = null;
-    S.aiStatus = await nanoStatus();
+    S.aiStatus = await chromeAiStatus();
     renderSorter();
     if (!resume) toast(`Couldn't download the AI model: ${e instanceof Error ? e.message : String(e)}`);
   }
+}
+
+function openAiSettings() {
+  const a = S.ai;
+  const chromeNote: Record<ChromeAiStatus, string> = {
+    available: "Ready.",
+    downloadable: "Needs a one-time download of a few GB.",
+    downloading: "Downloading.",
+    unavailable: "Not available on this computer.",
+    unsupported: "Needs Chrome 138 or later.",
+  };
+  const radio = (choice: AiChoice, title: string, note: string, fields = "") =>
+    `<label class="choice"><input type="radio" name="ai-choice" value="${choice}"${a.choice === choice ? " checked" : ""}>` +
+    `<span><strong>${title}</strong><small>${note}</small></span></label>${fields ? `<div class="fields" data-for="${choice}">${fields}</div>` : ""}`;
+  const field = (id: string, label: string, value: string, extra = "") =>
+    `<label class="field"><span>${label}</span><input id="${id}" value="${esc(value)}" autocomplete="off" spellcheck="false"${extra}></label>`;
+  showOverlay(`<div class="dialog wide" role="dialog" aria-modal="true" aria-label="AI settings">
+    <header>AI settings<small>Which AI groups your tabs by subject. ↑↓ to choose · Tab to move between fields · Enter to save · Esc to cancel</small></header>
+    <div class="body settings">
+      ${radio("chrome", "Chrome's built-in AI", `Runs on this computer; nothing is sent anywhere. ${chromeNote[S.aiStatus]}`)}
+      ${radio(
+        "gemini",
+        "Gemini API",
+        `Google's online model, with a free tier. Get a key at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>. Tab titles are sent to Google, which may use free-tier data to improve its products.`,
+        field("ai-gemini-key", "API key", a.gemini.apiKey, ' type="password"') + field("ai-gemini-model", "Model", a.gemini.model),
+      )}
+      ${radio(
+        "openai",
+        "OpenAI-compatible API",
+        "OpenRouter, Groq, a local Ollama or LM Studio, and others. Tab titles are sent to that service.",
+        field("ai-openai-url", "Address", a.openai.baseUrl, ' placeholder="https://openrouter.ai/api/v1"') +
+          field("ai-openai-key", "API key", a.openai.apiKey, ' type="password" placeholder="Not needed for local servers"') +
+          field("ai-openai-model", "Model", a.openai.model, ' placeholder="e.g. google/gemma-4-31b-it:free"'),
+      )}
+      ${radio("site", "No AI", "Group tabs by website.")}
+      <p class="error" id="ai-error" hidden></p>
+    </div>
+    <footer><button type="button" id="ai-cancel">Cancel<kbd>esc</kbd></button><button type="button" class="primary" id="ai-save">Save<kbd>↵</kbd></button></footer></div>`);
+  const value = (id: string) => $<HTMLInputElement>(`#${id}`).value;
+  const choice = () => (document.querySelector<HTMLInputElement>('input[name="ai-choice"]:checked')?.value ?? "chrome") as AiChoice;
+  const showFields = () => {
+    for (const f of document.querySelectorAll<HTMLElement>(".settings .fields")) f.hidden = f.dataset.for !== choice();
+  };
+  for (const r of document.querySelectorAll<HTMLInputElement>('input[name="ai-choice"]')) r.addEventListener("change", showFields);
+  showFields();
+  const save = async () => {
+    const next: AiSettings = {
+      choice: choice(),
+      gemini: { apiKey: value("ai-gemini-key").trim(), model: value("ai-gemini-model").trim() || DEFAULT_AI_SETTINGS.gemini.model },
+      openai: { baseUrl: value("ai-openai-url").trim(), apiKey: value("ai-openai-key").trim(), model: value("ai-openai-model").trim() },
+    };
+    const error = $("#ai-error");
+    const missing = missingSetting(next);
+    if (missing) {
+      error.textContent = `Please fill in ${missing}.`;
+      error.hidden = false;
+      return;
+    }
+    // Asking for permission needs the click or key press that's happening right now.
+    if (!(await requestPermission(next))) {
+      error.textContent = "Chrome didn't give permission to reach that website, so this AI can't be used.";
+      error.hidden = false;
+      return;
+    }
+    closeModal();
+    await setAiSettings(next);
+  };
+  S.modal = (e) => {
+    if (e.key === "Escape") closeModal();
+    else if (e.key === "Enter" && !(e.target as HTMLElement).closest("a")) void save();
+    else return;
+    e.preventDefault();
+  };
+  $("#ai-save").addEventListener("click", () => void save());
+  $("#ai-cancel").addEventListener("click", closeModal);
+  document.querySelector<HTMLInputElement>('input[name="ai-choice"]:checked')?.focus();
 }
 
 /* ---------------------------------------------------------------- actions */
@@ -1014,6 +1116,7 @@ function openHelp() {
     [["y"], "Copy the tab's full URL"],
     [["/"], "Filter"],
     [["r"], "Re-scan tabs"],
+    [["s"], "AI settings"],
     [["⇧", "↵"], "Apply ticked changes"],
     [["esc"], "Close dialog / clear filter"],
   ];
@@ -1071,6 +1174,7 @@ document.addEventListener("keydown", (e) => {
   else if (k === "l" || k === "ArrowRight") expand(r);
   else if (k === "m") openMove();
   else if (k === "n") openPropose();
+  else if (k === "s") openAiSettings();
   else if (k === "d") void deleteUserGroup();
   else if (k === "e" || k === "F2") startRename();
   else if (k === "c") void cycleColor();
@@ -1138,9 +1242,10 @@ chrome.runtime.onMessage.addListener((msg: { type?: string }) => {
   const stored = await loadState();
   S.userGroups = stored.userGroups;
   S.leftoversWindowId = stored.leftoversWindowId;
-  S.sorterPref = stored.sorterPref;
-  S.aiStatus = await nanoStatus();
-  if (S.aiStatus === "downloading" && S.sorterPref === "ai") void startDownload(true);
+  S.ai = stored.ai;
+  S.aiStatus = await chromeAiStatus();
+  S.aiAllowed = await hasPermission(S.ai);
+  if (S.aiStatus === "downloading" && S.ai.choice === "chrome") void startDownload(true);
   await rescan();
   listEl.focus({ preventScroll: true });
 })();
