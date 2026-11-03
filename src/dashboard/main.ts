@@ -472,7 +472,40 @@ async function replan() {
   render();
 }
 
+/** A prominent notice above the list while tabs are sorted by website only because the AI isn't ready. */
+function renderBanner() {
+  const el = $("#aibanner");
+  let html = "";
+  if (S.download !== null) {
+    const pct = Math.round(S.download * 100);
+    html =
+      `<div class="aibanner-text"><strong>Downloading Chrome's on-device AI model… ${pct}%</strong>` +
+      `<span>Tabs stay grouped by website until it finishes. You can keep using this page meanwhile.</span></div>` +
+      `<div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><div style="width:${pct}%"></div></div>`;
+  } else if (S.sorterPref === "ai" && (S.aiStatus === "downloadable" || S.aiStatus === "downloading")) {
+    html =
+      `<div class="aibanner-text"><strong>Tabs are grouped by website for now</strong>` +
+      `<span>Download Chrome's on-device AI model to group them by subject instead. It's a one-time download of a few GB. It runs on this computer, and your tabs are never sent anywhere.</span></div>` +
+      `<button type="button" class="primary" data-act="download">${S.aiStatus === "downloading" ? "Finish downloading" : "Download AI model"}</button>`;
+  } else if (S.sorterPref === "ai" && (S.aiStatus === "unavailable" || S.aiStatus === "unsupported")) {
+    html =
+      `<div class="aibanner-text"><strong>Tabs are grouped by website</strong><span>` +
+      (S.aiStatus === "unsupported"
+        ? "Grouping by subject uses Chrome's on-device AI, which needs Chrome 138 or later."
+        : "Grouping by subject uses Chrome's on-device AI, and Chrome says it isn't available on this computer. It needs 22 GB of free disk space and either a GPU with more than 4 GB of video memory or 16 GB of RAM. chrome://on-device-internals shows the details.") +
+      `</span></div>`;
+  }
+  if (html) el.classList.toggle("muted", S.aiStatus === "unavailable" || S.aiStatus === "unsupported");
+  el.innerHTML = html;
+  el.hidden = !html;
+}
+
+$("#aibanner").addEventListener("click", (e) => {
+  if ((e.target as HTMLElement).closest("[data-act=download]")) void startDownload();
+});
+
 function renderSorter() {
+  renderBanner();
   const el = $("#sorter");
   const button = (act: string, label: string, title = "") =>
     `<button type="button" class="link" data-act="${act}"${title ? ` title="${esc(title)}"` : ""}>${label}</button>`;
@@ -519,7 +552,8 @@ async function setSorterPref(pref: SorterPref) {
   await replan();
 }
 
-async function startDownload() {
+/** `resume` joins a download that is already running, without asking for a click. */
+async function startDownload(resume = false) {
   S.download = 0;
   // Start the download first: Chrome only allows it straight after a click.
   const done = downloadNano((f) => {
@@ -536,7 +570,7 @@ async function startDownload() {
     S.download = null;
     S.aiStatus = await nanoStatus();
     renderSorter();
-    toast(`Couldn't download the AI model: ${e instanceof Error ? e.message : String(e)}`);
+    if (!resume) toast(`Couldn't download the AI model: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 
@@ -1071,6 +1105,7 @@ chrome.runtime.onMessage.addListener((msg: { type?: string }) => {
   S.leftoversWindowId = stored.leftoversWindowId;
   S.sorterPref = stored.sorterPref;
   S.aiStatus = await nanoStatus();
+  if (S.aiStatus === "downloading" && S.sorterPref === "ai") void startDownload(true);
   await rescan();
   listEl.focus({ preventScroll: true });
 })();
