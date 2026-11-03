@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wrangle Tabs</title>
+</head>
+<body>
+  <div class="page">
+    <header class="top">
+      <h1>Wrangle Tabs</h1>
+      <div class="stats" id="stats"></div>
+      <div class="sorter" id="sorter"></div>
+    </header>
+
+    <div class="grid">
+      <main>
+        <div class="filterbar">
+          <input id="filter" type="search" placeholder="Filter by title or site  ( / )" aria-label="Filter suggestions" autocomplete="off">
+          <button id="propose" type="button">+ Propose group<kbd>n</kbd></button>
+        </div>
+        <div id="list" tabindex="0" role="listbox" aria-multiselectable="true" aria-label="Suggested changes">
+          <div class="row info">Reading your tabs…</div>
+        </div>
+      </main>
+      <aside class="rail">
+        <section class="panel" aria-label="Your windows">
+          <h3>Your windows now</h3>
+          <div id="windows"></div>
+        </section>
+        <section class="panel" aria-label="Keyboard shortcuts">
+          <h3>Keys</h3>
+          <div class="keys">
+            <span><kbd>j</kbd><kbd>k</kbd></span><span>Move down / up</span>
+            <span><kbd>J</kbd><kbd>K</kbd></span><span>Next / previous section</span>
+            <span><kbd>x</kbd><kbd>space</kbd></span><span>Tick or untick</span>
+            <span><kbd>a</kbd></span><span>Tick or untick whole section</span>
+            <span><kbd>m</kbd></span><span>Move tab to another group</span>
+            <span><kbd>y</kbd></span><span>Copy full URL</span>
+            <span><kbd>n</kbd></span><span>Propose your own group</span>
+            <span><kbd>d</kbd></span><span>Delete a group you proposed</span>
+            <span><kbd>e</kbd></span><span>Rename new group</span>
+            <span><kbd>c</kbd></span><span>Change group color</span>
+            <span><kbd>⇧</kbd><kbd>↵</kbd></span><span>Apply ticked changes</span>
+            <span><kbd>?</kbd></span><span>All shortcuts</span>
+          </div>
+        </section>
+      </aside>
+    </div>
+  </div>
+
+  <div class="applybar"><div class="in">
+    <div class="cururl" id="cururl" aria-live="polite"></div>
+    <div class="summary" id="summary"></div>
+    <button id="rescan" type="button">Re-scan<kbd>r</kbd></button>
+    <button id="apply" class="primary" type="button">Apply ticked<kbd>⇧↵</kbd></button>
+  </div></div>
+
+  <div id="overlayRoot"></div>
+  <div id="toastRoot" aria-live="polite"></div>
+  <script type="module" src="/src/dashboard/main.ts"></script>
+</body>
+</html>
