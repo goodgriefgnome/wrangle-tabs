@@ -171,3 +171,4 @@ button.link:focus-visible { outline: 2px solid var(--cursor-edge); outline-offse
 .applybtn kbd { font-size: 10px; }
 .chip.closechip { background: var(--danger); color: var(--surface); }
 .summary kbd { font-size: 10.5px; }
+.modelio .txt.muted { color: var(--muted); }

@@ -127,6 +127,20 @@ export function parseAnswer(raw: string): Map<number, { subject: string; group: 
   return out;
 }
 
+/** The complete answers in an answer that was cut off part way. */
+export function parsePartialAnswer(raw: string): Map<number, { subject: string; group: string }> {
+  const out = new Map<number, { subject: string; group: string }>();
+  for (const m of raw.matchAll(/\{[^{}]*\}/g)) {
+    try {
+      const a = JSON.parse(m[0]) as { tab?: unknown; subject?: unknown; group?: unknown };
+      if (typeof a.tab === "number" && typeof a.group === "string") out.set(a.tab, { subject: String(a.subject ?? ""), group: a.group });
+    } catch {
+      // Not finished.
+    }
+  }
+  return out;
+}
+
 /** Turns one topic answer ("E1", "none", "Baking", …) into a target. */
 export function resolveAnswer(answer: string, input: SortInput, topics: string[]): SortTarget {
   const text = answer.trim().replace(/^["'“”]+|["'“”.]+$/g, "").trim();
@@ -176,6 +190,8 @@ export class ModelSorter implements Sorter {
   lastFallbackCount = 0;
   /** The last error from the model in the last sort, if any. */
   lastError: string | null = null;
+  /** Whether the user stopped the last sort before the model was done. */
+  stopped = false;
   private cache = new Map<string, { subject: string; target: SortTarget }>();
   private lastSubjects = new Map<number, string>();
 
@@ -200,8 +216,10 @@ export class ModelSorter implements Sorter {
   }
 
   async sort(input: SortInput, options: SortOptions = {}): Promise<Map<number, SortTarget>> {
-    const { signal, onProgress, onModel } = options;
+    const { signal, onProgress, onModel, stop } = options;
+    const modelSignal = stop && signal ? AbortSignal.any([signal, stop]) : (stop ?? signal);
     this.lastError = null;
+    this.stopped = false;
     const siteLabels = new Set(
       [...input.tabs, ...input.existingGroups.flatMap((g) => g.tabs)].map((t) => siteLabel(t.url)).filter((l): l is string => !!l),
     );
@@ -226,40 +244,64 @@ export class ModelSorter implements Sorter {
     };
     for (const v of result.values()) if (v.kind === "new") addTopic(v.name);
 
+    let batch: TabInfo[] = [];
+    let offered: string[] = [];
+    let partial = "";
+    const useAnswers = (answers: Map<number, { subject: string; group: string }>) => {
+      batch.forEach((t, k) => {
+        const answer = answers.get(k + 1);
+        if (!answer) return;
+        let subject = answer.subject.trim().replace(/\s+/g, " ");
+        if (isSiteName(subject, siteLabels)) subject = cleanTitle(t.title, t.url);
+        subject = clip(subject, 60);
+        let target = resolveAnswer(answer.group, input, offered);
+        // A website name is not a topic: fall back to the subject, which still groups identical subjects.
+        if (target.kind === "new" && isSiteName(target.name, siteLabels)) target = { kind: "new", name: subject };
+        if (target.kind === "new") target = { kind: "new", name: addTopic(target.name) };
+        this.cache.set(tabKey(t), { subject, target });
+        this.lastSubjects.set(t.id, subject);
+        result.set(t.id, target);
+      });
+    };
+
     onProgress?.(0, todo.length);
     let size = this.model.maxBatch;
     let i = 0;
     while (i < todo.length) {
       signal?.throwIfAborted();
-      let batch = todo.slice(i, i + size);
+      if (stop?.aborted) break;
+      batch = todo.slice(i, i + size);
+      partial = "";
       try {
-        const request = (prompt: string): ModelRequest => ({ system: SYSTEM_PROMPT, prompt, schema: SCHEMA, signal });
+        const request = (prompt: string): ModelRequest => ({ system: SYSTEM_PROMPT, prompt, schema: SCHEMA, signal: modelSignal });
         let prompt = buildPrompt(input, topics, batch);
         while (batch.length > MIN_BATCH && !(await fits(this.model, request(prompt), batch.length))) {
           size = Math.max(MIN_BATCH, Math.floor(batch.length * 0.6));
           batch = todo.slice(i, i + size);
           prompt = buildPrompt(input, topics, batch);
         }
-        onModel?.({ kind: "input", items: batch.map((t) => cleanTitle(t.title, t.url)) });
-        const raw = await this.model.complete({ ...request(prompt), onText: (text) => onModel?.({ kind: "output", text }) });
-        const answers = parseAnswer(raw);
-        const offered = [...topics];
-        batch.forEach((t, k) => {
-          const answer = answers.get(k + 1);
-          if (!answer) return;
-          let subject = answer.subject.trim().replace(/\s+/g, " ");
-          if (isSiteName(subject, siteLabels)) subject = cleanTitle(t.title, t.url);
-          subject = clip(subject, 60);
-          let target = resolveAnswer(answer.group, input, offered);
-          // A website name is not a topic: fall back to the subject, which still groups identical subjects.
-          if (target.kind === "new" && isSiteName(target.name, siteLabels)) target = { kind: "new", name: subject };
-          if (target.kind === "new") target = { kind: "new", name: addTopic(target.name) };
-          this.cache.set(tabKey(t), { subject, target });
-          this.lastSubjects.set(t.id, subject);
-          result.set(t.id, target);
+        const ids: Record<string, string> = {};
+        input.userGroups.forEach((g, n) => (ids[`U${n + 1}`] = g.name));
+        input.existingGroups.forEach(({ group }, n) => (ids[`E${n + 1}`] = group.title || "Unnamed group"));
+        topics.forEach((name, n) => (ids[`N${n + 1}`] = name));
+        onModel?.({ kind: "input", items: batch.map((t) => cleanTitle(t.title, t.url)), groups: ids });
+        offered = [...topics];
+        const raw = await this.model.complete({
+          ...request(prompt),
+          onText: (text) => {
+            partial = text;
+            onModel?.({ kind: "output", text });
+          },
         });
+        useAnswers(parseAnswer(raw));
       } catch (e) {
         if (signal?.aborted) throw e;
+        if (stop?.aborted) {
+          // Keep the answers the model had finished before it was stopped.
+          useAnswers(parsePartialAnswer(partial));
+          this.stopped = true;
+          break;
+        }
         this.lastError = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
         onModel?.({ kind: "error", text: this.lastError });
         console.warn(`${this.model.name} couldn't sort a batch of tabs; sorting them by website.`, e);
@@ -267,6 +309,7 @@ export class ModelSorter implements Sorter {
       i += batch.length;
       onProgress?.(i, todo.length);
     }
+    if (stop?.aborted) this.stopped = true;
 
     const missing = input.tabs.filter((t) => !result.has(t.id));
     this.lastFallbackCount = missing.length;

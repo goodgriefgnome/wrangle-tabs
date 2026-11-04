@@ -18,13 +18,16 @@ export type SortTarget =
  * stage 2 adds a Gemini Nano sorter behind the same interface.
  */
 export type ModelEvent =
-  | { kind: "input"; items: string[] }
+  /** `groups` maps the ids the model may answer with ("E1", "U2", "N3") to group names. */
+  | { kind: "input"; items: string[]; groups: Record<string, string> }
   | { kind: "output"; text: string }
   | { kind: "error"; text: string };
 
 export interface SortOptions {
   /** Aborted when a newer sort supersedes this one. */
   signal?: AbortSignal;
+  /** Aborted when the user stops a slow sorter: the tabs not sorted yet are sorted the simple way. */
+  stop?: AbortSignal;
   /** Called as tabs get sorted, for slow sorters. `phase` names a step that has no count. */
   onProgress?: (done: number, total: number, phase?: "grouping") => void;
   /** What a model-based sorter is sending and receiving right now, for display. */

@@ -4,7 +4,7 @@ import { takeSnapshot } from "../chrome/snapshot";
 import { hasPermission, missingSetting, modelFor, requestPermission, type AiChoice, type AiSettings, DEFAULT_AI_SETTINGS } from "../chrome/aiSettings";
 import { chromeAiStatus, downloadChromeAi, type ChromeAiStatus } from "../chrome/models/chromeAi";
 import { loadState, saveAiSettings, saveLeftoversWindowId, saveUserGroups } from "../chrome/storage";
-import { ModelSorter } from "../core/modelSorter";
+import { ModelSorter, parsePartialAnswer } from "../core/modelSorter";
 import { buildPlan, type ManualTarget, type NewGroupPlan, type Plan } from "../core/plan";
 import { SiteSorter } from "../core/siteSorter";
 import type { Sorter } from "../core/sorter";
@@ -39,8 +39,9 @@ const S = {
     total: number;
     /** When the current batch went to the model. */
     batchStart?: number;
-    /** Titles in the current batch, and the model's answer so far. */
+    /** Titles in the current batch, the group ids the model may use, and its answer so far. */
     input?: string[];
+    groupIds?: Record<string, string>;
     output?: string;
     error?: string;
   },
@@ -432,6 +433,7 @@ function sortExplanation(tabId: number): string {
   if (!(sorter instanceof ModelSorter)) return `Sorted by website: ${whyNoAi()}.`;
   const subject = sorter.subjectOf(tabId);
   if (!subject) {
+    if (sorter.stopped) return "AI: stopped before it reached this tab, so it was sorted by website. Press R to sort everything again.";
     const err = sorter.lastError;
     return `AI: no answer for this tab, so it was sorted by website.${err ? ` Error: ${err}` : ""}`;
   }
@@ -469,6 +471,8 @@ function activeSorter(): Sorter {
 
 let replanGeneration = 0;
 let replanAbort: AbortController | null = null;
+/** Stops the AI sort that's running; the rest of the tabs get sorted by website. */
+let replanStop: AbortController | null = null;
 
 /** Re-sorts. A newer call cancels an older one that is still running. */
 async function replan() {
@@ -477,6 +481,8 @@ async function replan() {
   replanAbort?.abort();
   const abort = new AbortController();
   replanAbort = abort;
+  const stop = new AbortController();
+  replanStop = stop;
   const current = () => generation === replanGeneration;
   try {
     const plan = await buildPlan({
@@ -487,6 +493,7 @@ async function replan() {
       sorter: activeSorter(),
       sortOptions: {
         signal: abort.signal,
+        stop: stop.signal,
         onProgress: (done, total) => {
           if (!current() || total === 0) return;
           S.sorting = { ...S.sorting, done, total };
@@ -497,7 +504,8 @@ async function replan() {
         },
         onModel: (event) => {
           if (!current() || !S.sorting) return;
-          if (event.kind === "input") Object.assign(S.sorting, { input: event.items, output: "", error: undefined, batchStart: Date.now() });
+          if (event.kind === "input")
+            Object.assign(S.sorting, { input: event.items, groupIds: event.groups, output: "", error: undefined, batchStart: Date.now() });
           else if (event.kind === "output") S.sorting.output = event.text;
           else S.sorting.error = event.text;
           renderBanner();
@@ -515,6 +523,11 @@ async function replan() {
   render();
 }
 
+/** Complete `{ tab, subject, group }` answers in a partly streamed model answer, in order. */
+function answeredTabs(output: string): { tab: number; subject: string; group: string }[] {
+  return [...parsePartialAnswer(output)].map(([tab, a]) => ({ tab, ...a }));
+}
+
 /** A prominent notice above the list: AI progress, or why tabs are only grouped by website. */
 function renderBanner() {
   const el = $("#aibanner");
@@ -525,19 +538,33 @@ function renderBanner() {
   if (S.sorting) {
     const p = S.sorting;
     // Tabs the model has finished answering in the current batch, counted from the streamed answer.
-    const answered = Math.min(p.input?.length ?? 0, (p.output?.match(/"group"\s*:\s*"[^"]*"/g) ?? []).length);
+    const answered = Math.min(p.input?.length ?? 0, answeredTabs(p.output ?? "").length);
     const done = Math.min(p.total, p.done + answered);
     const pct = p.total ? Math.round((done / p.total) * 100) : 0;
     const secs = p.batchStart ? Math.floor((Date.now() - p.batchStart) / 1000) : 0;
-    // Show the end of the answer, where the model is writing right now.
-    const out = p.error ? `failed: ${p.error}` : (p.output ?? "").replace(/\s+/g, " ").slice(-220);
+    // The answers the model has finished so far, newest last, as "title → subject → group".
+    const finished = answeredTabs(p.output ?? "").map(
+      (a) => {
+        const id = a.group.trim().toUpperCase().replace(/\s+/g, "");
+        const group = /^none$/i.test(a.group.trim()) ? "Leftovers" : (p.groupIds?.[id] ?? a.group);
+        return `${p.input?.[a.tab - 1] ?? `Tab ${a.tab}`} → “${a.subject}” → ${group}`;
+      },
+    );
+    const outLines = p.error
+      ? [`<span class="txt err">failed: ${esc(p.error)}</span>`]
+      : finished.length
+        ? finished.slice(-3).map((line) => `<span class="txt">${esc(line)}</span>`)
+        : [`<span class="txt muted">${p.output ? "The model is writing its answer…" : "Waiting for the model…"}</span>`];
     html =
       `<div class="aibanner-text"><strong>Sorting with ${esc(name)}… ${done} of ${p.total} tabs</strong>` +
       `<span>${p.input ? `This batch: ${p.input.length} tabs, ${secs} s so far` : "Starting the model…"}</span></div>` +
+      `<button type="button" data-act="settings">AI settings</button>` +
+      `<button type="button" data-act="stop" title="The tabs not sorted yet are sorted by website">Stop</button>` +
       `<div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><div style="width:${pct}%"></div></div>` +
       (p.input
         ? `<div class="modelio"><div><span class="dir">in</span><span class="txt">${esc(p.input.join(" · "))}</span></div>` +
-          `<div><span class="dir">out</span><span class="txt tail${p.error ? " err" : ""}"><span>${esc(out) || "…"}</span></span></div></div>`
+          outLines.map((line, i) => `<div><span class="dir">${i === 0 ? "out" : ""}</span>${line}</div>`).join("") +
+          `</div>`
         : "");
   } else if (S.download !== null) {
     const pct = Math.round(S.download * 100);
@@ -580,6 +607,10 @@ function onAiAction(e: Event) {
   if (act === "download") void startDownload();
   else if (act === "settings") openAiSettings();
   else if (act === "allow") void allowAi();
+  else if (act === "stop") {
+    replanStop?.abort();
+    toast("Stopped. The tabs the AI hadn't reached are sorted by website.");
+  }
 }
 $("#aibanner").addEventListener("click", onAiAction);
 $("#sorter").addEventListener("click", onAiAction);
@@ -590,13 +621,14 @@ function renderSorter() {
   const settings = `<button type="button" class="link" data-act="settings">AI settings</button>`;
   const sorter = activeSorter();
   if (S.sorting) {
-    el.innerHTML = `Sorting with ${esc(sorter instanceof ModelSorter ? sorter.model.name : "AI")}…`;
+    el.innerHTML = `Sorting with ${esc(sorter instanceof ModelSorter ? sorter.model.name : "AI")}… · ${settings}`;
   } else if (S.download !== null) {
     el.innerHTML = `Downloading the AI model… ${Math.round(S.download * 100)}%`;
   } else if (sorter instanceof ModelSorter) {
     const fb = sorter.lastFallbackCount;
     const err = sorter.lastError;
-    el.innerHTML = `${esc(sorter.label)}${fb ? ` <span${err ? ` title="${esc(err)}"` : ""}>(${fb} by website, the AI failed on them)</span>` : ""} · ${settings}`;
+    const why = sorter.stopped ? "you stopped the AI" : "the AI failed on them";
+    el.innerHTML = `${esc(sorter.label)}${fb ? ` <span${err ? ` title="${esc(err)}"` : ""}>(${fb} by website, ${why})</span>` : ""} · ${settings}`;
   } else {
     el.innerHTML = `Sorted by website · ${settings}`;
   }
@@ -1158,9 +1190,18 @@ document.addEventListener("keydown", (e) => {
   if (S.modal) return S.modal(e);
   const target = e.target as HTMLElement;
   if (target === filterEl || target.id === "rename-input") return;
-  if (e.metaKey || e.ctrlKey || e.altKey || S.busy || !S.plan) return;
-  const r = curRow();
+  if (e.metaKey || e.ctrlKey || e.altKey || S.busy) return;
   const k = e.key;
+  // These work even before the first sort has finished.
+  if (k === "s" || k === "?" || k === "n") {
+    e.preventDefault();
+    if (k === "s") openAiSettings();
+    else if (k === "?") openHelp();
+    else openPropose();
+    return;
+  }
+  if (!S.plan) return;
+  const r = curRow();
   let handled = true;
   if (k === "j" || k === "ArrowDown") moveCursor(1);
   else if (k === "k" || k === "ArrowUp") moveCursor(-1);
@@ -1173,16 +1214,13 @@ document.addEventListener("keydown", (e) => {
   else if (k === "h" || k === "ArrowLeft") collapse(r);
   else if (k === "l" || k === "ArrowRight") expand(r);
   else if (k === "m") openMove();
-  else if (k === "n") openPropose();
-  else if (k === "s") openAiSettings();
   else if (k === "d") void deleteUserGroup();
   else if (k === "e" || k === "F2") startRename();
   else if (k === "c") void cycleColor();
   else if (k === "/") {
     filterEl.focus();
     filterEl.select();
-  } else if (k === "?") openHelp();
-  else if (k === "r") void rescan().then(() => toast("Re-scanned your tabs."));
+  } else if (k === "r") void rescan().then(() => toast("Re-scanned your tabs."));
   else if (k === "R") {
     modelSorter?.forget();
     void rescan().then(() => toast("Re-sorted all tabs."));

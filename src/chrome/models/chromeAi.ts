@@ -94,13 +94,17 @@ export function chromeAiModel(): Model {
         }
         let text = "";
         const reader = session.promptStreaming(prompt, options).getReader();
+        // Stop reading as soon as the request is cancelled, even if the stream doesn't notice.
+        signal?.addEventListener("abort", () => void reader.cancel().catch(() => {}), { once: true });
         for (;;) {
+          signal?.throwIfAborted();
           const { done, value } = await reader.read();
           if (done) break;
           // Older Chrome versions sent the whole answer so far in each chunk; newer ones send only the new part.
           text = value.startsWith(text) && text ? value : text + value;
           onText?.(text);
         }
+        signal?.throwIfAborted();
         return text;
       } finally {
         session.destroy();
