@@ -1,5 +1,5 @@
 import type { Model, ModelRequest } from "../../core/model";
-import { apiError, sseData } from "./http";
+import { apiError, fetchOrExplain, sseData } from "./http";
 
 /** The Gemini API (Google AI Studio), which has a free tier. Get a key at https://aistudio.google.com/apikey. */
 export interface GeminiSettings {
@@ -8,8 +8,6 @@ export interface GeminiSettings {
   model: string;
 }
 
-export const GEMINI_ORIGIN = "https://generativelanguage.googleapis.com/*";
-
 export function geminiModel({ apiKey, model }: GeminiSettings): Model {
   return {
     name: "Gemini API",
@@ -17,7 +15,7 @@ export function geminiModel({ apiKey, model }: GeminiSettings): Model {
     contextTokens: 200_000,
     async complete({ system, prompt, schema, signal, onText }: ModelRequest) {
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
-      const response = await fetch(url, {
+      const response = await fetchOrExplain(url, "Gemini API", {
         method: "POST",
         signal,
         headers: { "content-type": "application/json", "x-goog-api-key": apiKey },

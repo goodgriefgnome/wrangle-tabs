@@ -1,5 +1,5 @@
 import type { Model, ModelRequest } from "../../core/model";
-import { apiError, sseData } from "./http";
+import { apiError, fetchOrExplain, sseData } from "./http";
 
 /**
  * Any API that speaks OpenAI's chat-completions format: OpenRouter, Groq,
@@ -25,7 +25,7 @@ export function openAiCompatibleModel({ baseUrl, apiKey, model }: OpenAiCompatib
   let schemaSupported = true;
 
   const send = (request: ModelRequest, withSchema: boolean) =>
-    fetch(url, {
+    fetchOrExplain(url, host, {
       method: "POST",
       signal: request.signal,
       headers: {

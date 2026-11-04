@@ -275,7 +275,7 @@ export class ModelSorter implements Sorter {
       try {
         const request = (prompt: string): ModelRequest => ({ system: SYSTEM_PROMPT, prompt, schema: SCHEMA, signal: modelSignal });
         let prompt = buildPrompt(input, topics, batch);
-        while (batch.length > MIN_BATCH && !(await fits(this.model, request(prompt), batch.length))) {
+        while (batch.length > MIN_BATCH && !(await untilAborted(fits(this.model, request(prompt), batch.length), modelSignal))) {
           size = Math.max(MIN_BATCH, Math.floor(batch.length * 0.6));
           batch = todo.slice(i, i + size);
           prompt = buildPrompt(input, topics, batch);
@@ -286,13 +286,13 @@ export class ModelSorter implements Sorter {
         topics.forEach((name, n) => (ids[`N${n + 1}`] = name));
         onModel?.({ kind: "input", items: batch.map((t) => cleanTitle(t.title, t.url)), groups: ids });
         offered = [...topics];
-        const raw = await this.model.complete({
+        const raw = await untilAborted(this.model.complete({
           ...request(prompt),
           onText: (text) => {
             partial = text;
             onModel?.({ kind: "output", text });
           },
-        });
+        }), modelSignal);
         useAnswers(parseAnswer(raw));
       } catch (e) {
         if (signal?.aborted) throw e;
@@ -302,7 +302,7 @@ export class ModelSorter implements Sorter {
           this.stopped = true;
           break;
         }
-        this.lastError = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+        this.lastError = e instanceof Error ? (e.name === "Error" ? e.message : `${e.name}: ${e.message}`) : String(e);
         onModel?.({ kind: "error", text: this.lastError });
         console.warn(`${this.model.name} couldn't sort a batch of tabs; sorting them by website.`, e);
       }
@@ -324,6 +324,29 @@ export class ModelSorter implements Sorter {
     for (const [id, v] of result) if (v.kind === "new" && counts.get(normName(v.name))! < 2) result.set(id, { kind: "left" });
     return result;
   }
+}
+
+/**
+ * Rejects as soon as `signal` aborts, even if `promise` never notices: some model
+ * calls (such as loading Chrome's built-in model) can't be cancelled.
+ */
+function untilAborted<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason ?? new DOMException("Stopped", "AbortError"));
+    if (signal.aborted) return onAbort();
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 /** Whether a request and its answer fit in the model's context. */

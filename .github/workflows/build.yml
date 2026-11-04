@@ -23,6 +23,10 @@ jobs:
       - run: npm test
       - run: npm run build
 
+      # A version per build, shown at chrome://extensions and on the dashboard, to tell which build is loaded.
+      - name: Stamp the build number
+        run: node -e 'const f="dist/manifest.json",m=JSON.parse(require("fs").readFileSync(f));m.version=m.version.replace(/\.\d+$/,"")+"."+process.env.GITHUB_RUN_NUMBER;require("fs").writeFileSync(f,JSON.stringify(m,null,2))'
+
       # Downloadable from the run's Summary page, for any branch.
       - uses: actions/upload-artifact@v4
         with:

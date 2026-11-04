@@ -1,6 +1,6 @@
 import type { Model } from "../core/model";
 import { chromeAiModel } from "./models/chromeAi";
-import { GEMINI_ORIGIN, geminiModel, type GeminiSettings } from "./models/gemini";
+import { geminiModel, type GeminiSettings } from "./models/gemini";
 import { openAiCompatibleModel, type OpenAiCompatibleSettings } from "./models/openAiCompatible";
 
 /**
@@ -39,9 +39,12 @@ export function missingSetting(s: AiSettings): string | null {
   return null;
 }
 
-/** Websites the extension needs permission to reach for a choice. */
+/**
+ * Websites the extension asks permission to reach for a choice. The Gemini API
+ * accepts requests from extension pages without it; OpenAI-compatible servers
+ * may not (a local Ollama, for one), so for those it's asked for, but not required.
+ */
 export function originsFor(s: AiSettings): string[] {
-  if (s.choice === "gemini") return [GEMINI_ORIGIN];
   if (s.choice === "openai") {
     try {
       return [`${new URL(s.openai.baseUrl).origin}/*`];
@@ -52,15 +55,19 @@ export function originsFor(s: AiSettings): string[] {
   return [];
 }
 
-export async function hasPermission(s: AiSettings): Promise<boolean> {
-  const origins = originsFor(s);
-  return !origins.length || chrome.permissions.contains({ origins });
-}
-
-/** Asks for permission to reach the model's website. Must be called from a click or key press. */
+/**
+ * Asks for permission to reach the model's website, if it needs asking. Must be
+ * called straight from a click or key press. Never throws: false when refused or failed.
+ */
 export async function requestPermission(s: AiSettings): Promise<boolean> {
   const origins = originsFor(s);
-  return !origins.length || chrome.permissions.request({ origins });
+  if (!origins.length) return true;
+  try {
+    return await chrome.permissions.request({ origins });
+  } catch (e) {
+    console.warn("Couldn't ask for permission to reach", origins, e);
+    return false;
+  }
 }
 
 let chromeModel: Model | null = null;

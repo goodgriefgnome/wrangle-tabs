@@ -10,7 +10,7 @@ Click the toolbar button (or press **Alt+Shift+T**) to open the dashboard. It sh
 2. Open `chrome://extensions` and turn on **Developer mode** (top right).
 3. Click **Load unpacked** and choose the unzipped folder.
 
-To update, download and unzip the new build over the same folder, then click the reload icon on the extension's card.
+To update, download and unzip the new build over the same folder, then click the reload icon on the extension's card. The dashboard shows the version next to its title; each build has its own number, so you can tell whether the new one is loaded.
 
 Builds of other branches are on the [Actions](https://github.com/goodgriefgnome/wrangle-tabs/actions) page: open a run and download **wrangle-tabs** under *Artifacts*.
 
@@ -46,7 +46,7 @@ Choose the model in **AI settings** (top right, or press `s`):
 - **OpenAI-compatible API**: OpenRouter, Groq, a local Ollama or LM Studio, and other services that accept OpenAI's chat-completions format. Tab titles are sent to that service.
 - **No AI**: tabs are sorted by website. Your proposed groups are filled first, by matching words in their name and hint, then the existing group that already holds tabs from the same site, then a new group per site with two or more tabs.
 
-API keys are stored only in this browser and are never synced. The extension asks for permission to reach an online model's website when you choose it.
+API keys are stored only in this browser and are never synced. The Gemini API needs no extra permission. For an OpenAI-compatible server, the extension asks for permission to reach it when you save; some servers (OpenRouter, for one) work without it, and a local Ollama needs either the permission or `OLLAMA_ORIGINS=chrome-extension://*`.
 
 The model decides from each tab and the current state of the groups (their names, and the tabs already in them), not from your earlier corrections. If it fails on some tabs, they're sorted by website, and the status line at the bottom says why. Answers are remembered per tab, so suggestions don't shift while you review them: re-scans only sort new tabs. Proposing or deleting a group, or pressing `R`, sorts everything again.
 

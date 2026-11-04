@@ -263,3 +263,28 @@ describe("ModelSorter", () => {
     expect(model.sessions()).toBe(0);
   });
 });
+
+describe("ModelSorter stop", () => {
+  it("stops at once even when the model never answers, keeping finished answers", async () => {
+    const t = [tab({ url: "https://react.dev/a", title: "useEffect – React" }), tab({ url: "https://vite.dev/c", title: "Configuring Vite" })];
+    const stop = new AbortController();
+    const model: Model = {
+      name: "stuck",
+      maxBatch: 30,
+      contextTokens: 100_000,
+      complete: (r) => {
+        r.onText?.('{"tabs":[{"tab":1,"subject":"React hooks","group":"Web development"},{"tab":2,');
+        setTimeout(() => stop.abort(), 10);
+        return new Promise(() => {}); // never answers, ignores the signal
+      },
+    };
+    const sorter = new ModelSorter(model);
+    const res = await sorter.sort({ tabs: t, existingGroups: [], userGroups: [] }, { stop: stop.signal });
+    expect(sorter.stopped).toBe(true);
+    expect(sorter.subjectOf(t[0].id)).toBe("React hooks");
+    expect(sorter.subjectOf(t[1].id)).toBeUndefined();
+    // The one-tab topic goes to Leftovers; the unanswered tab is sorted by website.
+    expect(res.get(t[0].id)).toEqual({ kind: "left" });
+    expect(res.has(t[1].id)).toBe(true);
+  });
+});

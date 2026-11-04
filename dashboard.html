@@ -8,14 +8,14 @@
 <body>
   <div class="page">
     <header class="top">
-      <h1>Wrangle Tabs</h1>
+      <h1>Wrangle Tabs <span class="version" id="version"></span></h1>
       <div class="stats" id="stats"></div>
       <div class="sorter" id="sorter"></div>
     </header>
 
     <div class="grid">
       <main>
-        <div id="aibanner" class="aibanner" hidden></div>
+        <div id="aibanner" class="aibanner" hidden><div class="aibanner-text" id="ab-text"></div><div class="ab-actions" id="ab-actions"></div><div class="ab-extra" id="ab-extra"></div></div>
         <div class="filterbar">
           <input id="filter" type="search" placeholder="Filter by title or site  ( / )" aria-label="Filter suggestions" autocomplete="off">
           <button id="propose" type="button">+ Propose group<kbd>n</kbd></button>

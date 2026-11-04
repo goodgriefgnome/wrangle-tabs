@@ -1,7 +1,7 @@
 import "./style.css";
 import { applyActions, switchToTab, type Actions } from "../chrome/apply";
 import { takeSnapshot } from "../chrome/snapshot";
-import { hasPermission, missingSetting, modelFor, requestPermission, type AiChoice, type AiSettings, DEFAULT_AI_SETTINGS } from "../chrome/aiSettings";
+import { missingSetting, modelFor, requestPermission, type AiChoice, type AiSettings, DEFAULT_AI_SETTINGS } from "../chrome/aiSettings";
 import { chromeAiStatus, downloadChromeAi, type ChromeAiStatus } from "../chrome/models/chromeAi";
 import { loadState, saveAiSettings, saveLeftoversWindowId, saveUserGroups } from "../chrome/storage";
 import { ModelSorter, parsePartialAnswer } from "../core/modelSorter";
@@ -48,8 +48,6 @@ const S = {
   ai: DEFAULT_AI_SETTINGS as AiSettings,
   /** Whether Chrome's built-in AI is ready, for the "chrome" choice. */
   aiStatus: "unsupported" as ChromeAiStatus,
-  /** Whether the extension may reach the online model's website, for online choices. */
-  aiAllowed: true,
   /** Model download progress (0..1) while this page is downloading it. */
   download: null as number | null,
 };
@@ -423,7 +421,6 @@ function whyNoAi(): string | null {
   }
   const missing = missingSetting(S.ai);
   if (missing) return `AI settings are missing ${missing}`;
-  if (!S.aiAllowed) return "the extension isn't allowed to reach the AI's website yet";
   return null;
 }
 
@@ -529,38 +526,50 @@ function answeredTabs(output: string): { tab: number; subject: string; group: st
 }
 
 /** A prominent notice above the list: AI progress, or why tabs are only grouped by website. */
+/** Sets an element's HTML only when it changed, so buttons inside aren't replaced mid-click. */
+const lastHTML = new WeakMap<Element, string>();
+function setHTML(el: Element, html: string) {
+  if (lastHTML.get(el) === html) return;
+  lastHTML.set(el, html);
+  el.innerHTML = html;
+}
+
 function renderBanner() {
   const el = $("#aibanner");
-  let html = "";
+  let text = "";
+  let actions = "";
+  let extra = "";
   let muted = false;
   const sorter = activeSorter();
   const name = sorter instanceof ModelSorter ? sorter.model.name : "AI";
+  const bar = (pct: number) =>
+    `<div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><div style="width:${pct}%"></div></div>`;
   if (S.sorting) {
     const p = S.sorting;
+    const finishedAnswers = answeredTabs(p.output ?? "");
     // Tabs the model has finished answering in the current batch, counted from the streamed answer.
-    const answered = Math.min(p.input?.length ?? 0, answeredTabs(p.output ?? "").length);
-    const done = Math.min(p.total, p.done + answered);
+    const done = Math.min(p.total, p.done + Math.min(p.input?.length ?? 0, finishedAnswers.length));
     const pct = p.total ? Math.round((done / p.total) * 100) : 0;
     const secs = p.batchStart ? Math.floor((Date.now() - p.batchStart) / 1000) : 0;
     // The answers the model has finished so far, newest last, as "title → subject → group".
-    const finished = answeredTabs(p.output ?? "").map(
-      (a) => {
-        const id = a.group.trim().toUpperCase().replace(/\s+/g, "");
-        const group = /^none$/i.test(a.group.trim()) ? "Leftovers" : (p.groupIds?.[id] ?? a.group);
-        return `${p.input?.[a.tab - 1] ?? `Tab ${a.tab}`} → “${a.subject}” → ${group}`;
-      },
-    );
+    const finished = finishedAnswers.map((a) => {
+      const id = a.group.trim().toUpperCase().replace(/\s+/g, "");
+      const group = /^none$/i.test(a.group.trim()) ? "Leftovers" : (p.groupIds?.[id] ?? a.group);
+      return `${p.input?.[a.tab - 1] ?? `Tab ${a.tab}`} → “${a.subject}” → ${group}`;
+    });
     const outLines = p.error
       ? [`<span class="txt err">failed: ${esc(p.error)}</span>`]
       : finished.length
         ? finished.slice(-3).map((line) => `<span class="txt">${esc(line)}</span>`)
         : [`<span class="txt muted">${p.output ? "The model is writing its answer…" : "Waiting for the model…"}</span>`];
-    html =
-      `<div class="aibanner-text"><strong>Sorting with ${esc(name)}… ${done} of ${p.total} tabs</strong>` +
-      `<span>${p.input ? `This batch: ${p.input.length} tabs, ${secs} s so far` : "Starting the model…"}</span></div>` +
+    text =
+      `<strong>Sorting with ${esc(name)}… ${done} of ${p.total} tabs</strong>` +
+      `<span>${p.input ? `This batch: ${p.input.length} tabs, ${secs} s so far` : "Starting the model…"}</span>`;
+    actions =
       `<button type="button" data-act="settings">AI settings</button>` +
-      `<button type="button" data-act="stop" title="The tabs not sorted yet are sorted by website">Stop</button>` +
-      `<div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><div style="width:${pct}%"></div></div>` +
+      `<button type="button" data-act="stop" title="The tabs not sorted yet are sorted by website">Stop</button>`;
+    extra =
+      bar(pct) +
       (p.input
         ? `<div class="modelio"><div><span class="dir">in</span><span class="txt">${esc(p.input.join(" · "))}</span></div>` +
           outLines.map((line, i) => `<div><span class="dir">${i === 0 ? "out" : ""}</span>${line}</div>`).join("") +
@@ -568,33 +577,37 @@ function renderBanner() {
         : "");
   } else if (S.download !== null) {
     const pct = Math.round(S.download * 100);
-    html =
-      `<div class="aibanner-text"><strong>Downloading Chrome's on-device AI model… ${pct}%</strong>` +
-      `<span>Tabs stay grouped by website until it finishes. You can keep using this page meanwhile.</span></div>` +
-      `<div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><div style="width:${pct}%"></div></div>`;
+    text =
+      `<strong>Downloading Chrome's on-device AI model… ${pct}%</strong>` +
+      `<span>Tabs stay grouped by website until it finishes. You can keep using this page meanwhile.</span>`;
+    actions = `<button type="button" data-act="settings">AI settings</button>`;
+    extra = bar(pct);
   } else if (S.ai.choice === "chrome" && (S.aiStatus === "downloadable" || S.aiStatus === "downloading")) {
-    html =
-      `<div class="aibanner-text"><strong>Tabs are grouped by website for now</strong>` +
-      `<span>Download Chrome's on-device AI model to group them by subject instead. It's a one-time download of a few GB. It runs on this computer, and your tabs are never sent anywhere. Or use an online model in AI settings.</span></div>` +
+    text =
+      `<strong>Tabs are grouped by website for now</strong>` +
+      `<span>Download Chrome's on-device AI model to group them by subject instead. It's a one-time download of a few GB. It runs on this computer, and your tabs are never sent anywhere. Or use an online model in AI settings.</span>`;
+    actions =
       `<button type="button" data-act="settings">AI settings</button>` +
       `<button type="button" class="primary" data-act="download">${S.aiStatus === "downloading" ? "Finish downloading" : "Download AI model"}</button>`;
   } else if (S.ai.choice === "chrome" && (S.aiStatus === "unavailable" || S.aiStatus === "unsupported")) {
     muted = true;
-    html =
-      `<div class="aibanner-text"><strong>Tabs are grouped by website</strong><span>` +
+    text =
+      `<strong>Tabs are grouped by website</strong><span>` +
       (S.aiStatus === "unsupported"
         ? "Chrome's on-device AI needs Chrome 138 or later."
         : "Chrome says its on-device AI isn't available on this computer. It needs 22 GB of free disk space and either a GPU with more than 4 GB of video memory or 16 GB of RAM. chrome://on-device-internals shows the details.") +
-      ` You can use an online model instead.</span></div><button type="button" data-act="settings">AI settings</button>`;
+      ` You can use an online model instead.</span>`;
+    actions = `<button type="button" data-act="settings">AI settings</button>`;
   } else if ((S.ai.choice === "gemini" || S.ai.choice === "openai") && whyNoAi()) {
-    html =
-      `<div class="aibanner-text"><strong>Tabs are grouped by website for now</strong><span>Because ${esc(whyNoAi()!)}.</span></div>` +
-      (missingSetting(S.ai) ? "" : `<button type="button" class="primary" data-act="allow">Allow</button>`) +
+    text = `<strong>Tabs are grouped by website for now</strong><span>Because ${esc(whyNoAi()!)}.</span>`;
+    actions =
       `<button type="button" data-act="settings">AI settings</button>`;
   }
   el.classList.toggle("muted", muted);
-  el.innerHTML = html;
-  el.hidden = !html;
+  el.hidden = !text;
+  setHTML($("#ab-text"), text);
+  setHTML($("#ab-actions"), actions);
+  setHTML($("#ab-extra"), extra);
 }
 
 // Keeps the "so far" seconds counting while the model works on a batch.
@@ -606,7 +619,6 @@ function onAiAction(e: Event) {
   const act = (e.target as HTMLElement).closest<HTMLElement>("[data-act]")?.dataset.act;
   if (act === "download") void startDownload();
   else if (act === "settings") openAiSettings();
-  else if (act === "allow") void allowAi();
   else if (act === "stop") {
     replanStop?.abort();
     toast("Stopped. The tabs the AI hadn't reached are sorted by website.");
@@ -621,16 +633,16 @@ function renderSorter() {
   const settings = `<button type="button" class="link" data-act="settings">AI settings</button>`;
   const sorter = activeSorter();
   if (S.sorting) {
-    el.innerHTML = `Sorting with ${esc(sorter instanceof ModelSorter ? sorter.model.name : "AI")}… · ${settings}`;
+    setHTML(el, `Sorting with ${esc(sorter instanceof ModelSorter ? sorter.model.name : "AI")}… · ${settings}`);
   } else if (S.download !== null) {
-    el.innerHTML = `Downloading the AI model… ${Math.round(S.download * 100)}%`;
+    setHTML(el, `Downloading the AI model… ${Math.round(S.download * 100)}%`);
   } else if (sorter instanceof ModelSorter) {
     const fb = sorter.lastFallbackCount;
     const err = sorter.lastError;
     const why = sorter.stopped ? "you stopped the AI" : "the AI failed on them";
-    el.innerHTML = `${esc(sorter.label)}${fb ? ` <span${err ? ` title="${esc(err)}"` : ""}>(${fb} by website, ${why})</span>` : ""} · ${settings}`;
+    setHTML(el, `${esc(sorter.label)}${fb ? ` <span${err ? ` title="${esc(err)}"` : ""}>(${fb} by website, ${why})</span>` : ""} · ${settings}`);
   } else {
-    el.innerHTML = `Sorted by website · ${settings}`;
+    setHTML(el, `Sorted by website · ${settings}`);
   }
 }
 
@@ -639,16 +651,7 @@ async function setAiSettings(ai: AiSettings) {
   S.ai = ai;
   modelSorter = null;
   await saveAiSettings(ai);
-  S.aiAllowed = await hasPermission(ai);
   if (ai.choice === "chrome") S.aiStatus = await chromeAiStatus();
-  renderSorter();
-  await replan();
-}
-
-async function allowAi() {
-  S.aiAllowed = await requestPermission(S.ai);
-  if (!S.aiAllowed) toast("Without that permission, tabs stay grouped by website.");
-  modelSorter = null;
   renderSorter();
   await replan();
 }
@@ -665,7 +668,11 @@ async function startDownload(resume = false) {
   try {
     await done;
     S.download = null;
-    await setAiSettings({ ...S.ai, choice: "chrome" });
+    S.aiStatus = await chromeAiStatus();
+    // Only re-sort; never change the choice, which the user may have changed meanwhile.
+    modelSorter = null;
+    renderSorter();
+    await replan();
   } catch (e) {
     S.download = null;
     S.aiStatus = await chromeAiStatus();
@@ -730,12 +737,9 @@ function openAiSettings() {
       error.hidden = false;
       return;
     }
-    // Asking for permission needs the click or key press that's happening right now.
-    if (!(await requestPermission(next))) {
-      error.textContent = "Chrome didn't give permission to reach that website, so this AI can't be used.";
-      error.hidden = false;
-      return;
-    }
+    // Asking for permission needs the click or key press that's happening right now. Saving doesn't wait
+    // for the answer: without the permission, the extension still tries, and errors say what went wrong.
+    void requestPermission(next);
     closeModal();
     await setAiSettings(next);
   };
@@ -1289,13 +1293,14 @@ chrome.runtime.onMessage.addListener((msg: { type?: string }) => {
 
 /* ---------------------------------------------------------------- start */
 
+$("#version").textContent = `v${chrome.runtime.getManifest().version}`;
+
 (async () => {
   const stored = await loadState();
   S.userGroups = stored.userGroups;
   S.leftoversWindowId = stored.leftoversWindowId;
   S.ai = stored.ai;
   S.aiStatus = await chromeAiStatus();
-  S.aiAllowed = await hasPermission(S.ai);
   if (S.aiStatus === "downloading" && S.ai.choice === "chrome") void startDownload(true);
   await rescan();
   listEl.focus({ preventScroll: true });

@@ -47,6 +47,13 @@ describe("Gemini API", () => {
     await expect(geminiModel({ apiKey: "bad", model: "m" }).complete(request)).rejects.toThrow("Gemini API: it answered 400 (API key not valid.)");
   });
 
+  it("explains when the server can't be reached", async () => {
+    vi.stubGlobal("fetch", async () => {
+      throw new TypeError("Failed to fetch");
+    });
+    await expect(geminiModel({ apiKey: "k", model: "m" }).complete(request)).rejects.toThrow("Gemini API: couldn't connect");
+  });
+
   it("explains a rate limit", async () => {
     vi.stubGlobal("fetch", async () => new Response("{}", { status: 429 }));
     await expect(geminiModel({ apiKey: "k", model: "m" }).complete(request)).rejects.toThrow("rate limit");

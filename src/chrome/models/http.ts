@@ -20,6 +20,18 @@ export async function* sseData(response: Response): AsyncGenerator<string> {
   }
 }
 
+/** fetch, but when the server can't be reached at all, says what to check. */
+export async function fetchOrExplain(url: string, service: string, init: RequestInit): Promise<Response> {
+  try {
+    return await fetch(url, init);
+  } catch (e) {
+    if (e instanceof DOMException && e.name === "AbortError") throw e;
+    throw new Error(
+      `${service}: couldn't connect. Check the address and your connection. A local server (such as Ollama) may also need to allow requests from extensions, for example by setting OLLAMA_ORIGINS=chrome-extension://*.`,
+    );
+  }
+}
+
 /** A readable error for a failed API response. */
 export async function apiError(response: Response, service: string): Promise<Error> {
   let detail = "";
