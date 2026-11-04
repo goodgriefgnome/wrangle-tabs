@@ -44,6 +44,8 @@ const S = {
     groupIds?: Record<string, string>;
     output?: string;
     error?: string;
+    /** News while waiting, such as "busy, trying again". */
+    status?: string;
   },
   ai: DEFAULT_AI_SETTINGS as AiSettings,
   /** Whether Chrome's built-in AI is ready, for the "chrome" choice. */
@@ -502,8 +504,9 @@ async function replan() {
         onModel: (event) => {
           if (!current() || !S.sorting) return;
           if (event.kind === "input")
-            Object.assign(S.sorting, { input: event.items, groupIds: event.groups, output: "", error: undefined, batchStart: Date.now() });
-          else if (event.kind === "output") S.sorting.output = event.text;
+            Object.assign(S.sorting, { input: event.items, groupIds: event.groups, output: "", error: undefined, status: undefined, batchStart: Date.now() });
+          else if (event.kind === "output") Object.assign(S.sorting, { output: event.text, status: undefined });
+          else if (event.kind === "status") S.sorting.status = event.text;
           else S.sorting.error = event.text;
           renderBanner();
         },
@@ -561,7 +564,7 @@ function renderBanner() {
       ? [`<span class="txt err">failed: ${esc(p.error)}</span>`]
       : finished.length
         ? finished.slice(-3).map((line) => `<span class="txt">${esc(line)}</span>`)
-        : [`<span class="txt muted">${p.output ? "The model is writing its answer…" : "Waiting for the model…"}</span>`];
+        : [`<span class="txt muted">${esc(p.status ?? (p.output ? "The model is writing its answer…" : "Waiting for the model…"))}</span>`];
     text =
       `<strong>Sorting with ${esc(name)}… ${done} of ${p.total} tabs</strong>` +
       `<span>${p.input ? `This batch: ${p.input.length} tabs, ${secs} s so far` : "Starting the model…"}</span>`;

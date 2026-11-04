@@ -51,7 +51,7 @@ export function openAiCompatibleModel({ baseUrl, apiKey, model }: OpenAiCompatib
           ? { response_format: { type: "json_schema", json_schema: { name: "answer", schema: request.schema, strict: false } } }
           : {}),
       }),
-    });
+    }, request.onStatus);
 
   return {
     name: `${model} at ${host}`,

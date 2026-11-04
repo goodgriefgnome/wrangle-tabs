@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { geminiModel } from "../src/chrome/models/gemini";
+import { retry } from "../src/chrome/models/http";
 import { openAiCompatibleModel } from "../src/chrome/models/openAiCompatible";
 
 /** A server-sent-events response made of these `data:` payloads, split at awkward places. */
@@ -17,6 +18,9 @@ function sse(payloads: string[], status = 200): Response {
 
 const request = { system: "Be helpful.", prompt: "Sort these.", schema: { type: "object" } };
 
+beforeEach(() => {
+  retry.delaysMs = [1, 1];
+});
 afterEach(() => vi.unstubAllGlobals());
 
 describe("Gemini API", () => {
@@ -51,7 +55,26 @@ describe("Gemini API", () => {
     vi.stubGlobal("fetch", async () => {
       throw new TypeError("Failed to fetch");
     });
-    await expect(geminiModel({ apiKey: "k", model: "m" }).complete(request)).rejects.toThrow("Gemini API: the request to generativelanguage.googleapis.com was blocked or couldn't connect (Failed to fetch)");
+    await expect(geminiModel({ apiKey: "k", model: "m" }).complete(request)).rejects.toThrow("Gemini API: no readable answer from generativelanguage.googleapis.com after 3 tries (Failed to fetch)");
+  });
+
+  it("retries while the service is busy, saying so", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("{}", { status: 503 }))
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockImplementation(async () => sse([JSON.stringify({ candidates: [{ content: { parts: [{ text: "{}" }] } }] })]));
+    vi.stubGlobal("fetch", fetch);
+    const status: string[] = [];
+    const out = await geminiModel({ apiKey: "k", model: "m" }).complete({ ...request, onStatus: (t) => status.push(t) });
+    expect(out).toBe("{}");
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(status[0]).toMatch(/^Gemini API is busy \(503\)\. Trying again/);
+  });
+
+  it("explains an overloaded service once retries run out", async () => {
+    vi.stubGlobal("fetch", async () => new Response(JSON.stringify({ error: { message: "The model is overloaded." } }), { status: 503 }));
+    await expect(geminiModel({ apiKey: "k", model: "m" }).complete(request)).rejects.toThrow("overloaded right now");
   });
 
   it("explains a rate limit", async () => {

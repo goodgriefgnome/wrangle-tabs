@@ -292,6 +292,7 @@ export class ModelSorter implements Sorter {
             partial = text;
             onModel?.({ kind: "output", text });
           },
+          onStatus: (text) => onModel?.({ kind: "status", text }),
         }), modelSignal);
         useAnswers(parseAnswer(raw));
       } catch (e) {

@@ -12,6 +12,8 @@ export interface ModelRequest {
   signal?: AbortSignal;
   /** Called with the whole answer so far, as it streams in. */
   onText?: (textSoFar: string) => void;
+  /** Called with news while waiting, such as "busy, trying again in 5 s". */
+  onStatus?: (text: string) => void;
 }
 
 export interface Model {

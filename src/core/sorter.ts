@@ -21,6 +21,7 @@ export type ModelEvent =
   /** `groups` maps the ids the model may answer with ("E1", "U2", "N3") to group names. */
   | { kind: "input"; items: string[]; groups: Record<string, string> }
   | { kind: "output"; text: string }
+  | { kind: "status"; text: string }
   | { kind: "error"; text: string };
 
 export interface SortOptions {

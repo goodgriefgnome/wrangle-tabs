@@ -13,7 +13,7 @@ export function geminiModel({ apiKey, model }: GeminiSettings): Model {
     name: "Gemini API",
     maxBatch: 150,
     contextTokens: 200_000,
-    async complete({ system, prompt, schema, signal, onText }: ModelRequest) {
+    async complete({ system, prompt, schema, signal, onText, onStatus }: ModelRequest) {
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
       const response = await fetchOrExplain(url, "Gemini API", {
         method: "POST",
@@ -24,7 +24,7 @@ export function geminiModel({ apiKey, model }: GeminiSettings): Model {
           contents: [{ role: "user", parts: [{ text: prompt }] }],
           generationConfig: { responseMimeType: "application/json", responseJsonSchema: schema, temperature: 0.2 },
         }),
-      });
+      }, onStatus);
       if (!response.ok) throw await apiError(response, "Gemini API");
       let text = "";
       for await (const data of sseData(response)) {
