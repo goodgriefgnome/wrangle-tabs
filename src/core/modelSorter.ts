@@ -180,29 +180,45 @@ export function resolveAnswer(answer: string, input: SortInput, topics: string[]
   return { kind: "new", name: topic ?? clip(text.replace(/\s+/g, " "), 40) };
 }
 
+/** What the sorter knows about each tab right now. */
+export interface SortResults {
+  /** Tabs the model has answered for. */
+  targets: Map<number, SortTarget>;
+  /** Tabs the model failed on, or that were skipped when the user stopped it: sort these another way. */
+  fallback: TabInfo[];
+  /** Tabs still waiting for the model. */
+  pending: TabInfo[];
+}
+
+export type RunOptions = SortOptions & {
+  /** Called whenever new answers arrive, as they stream in. */
+  onAnswer?: () => void;
+};
+
 /**
  * Sorts tabs with a language model (see ./model.ts for the models it can use).
  * For each tab the model writes a subject and then picks a group, in one answer.
- * - Tabs go to the model in batches that fit its context window. Topic names
- *   from earlier batches are offered to later ones, so topics stay consistent.
- * - Answers are remembered per tab until forget() is called, so re-scans only ask about new tabs
- *   and suggestions stay put while the user reviews them.
+ * - run() works through a queue: before each batch it asks for the current tabs and groups,
+ *   so it keeps going across re-scans, and tabs asked about again (forgetTabs) jump the queue.
+ * - Answers are stored as they stream in, per tab, until forgotten; results() reads them.
  * - Tabs go to the model in the order they sit in the browser, and the prompt says so,
  *   because neighbouring tabs are more likely to be related.
- * - Website names are rejected as topics; a topic with a single tab goes to Leftovers.
- * - Tabs the model fails on are sorted by website.
- * - A tab left over between two neighbours that go to the same group joins them.
+ * - Batches fit the model's context window. Topic names already in use are offered to later batches.
+ * - Website names are rejected as topics. settle() sends single-tab topics to Leftovers, and
+ *   puts a leftover between two neighbours of the same group into that group.
+ * - Tabs the model fails on, or that are skipped when it's stopped, are left to a fallback sorter.
  */
 export class ModelSorter implements Sorter {
   readonly label: string;
-  /** Tabs the model failed on in the last sort, which were sorted by website instead. */
+  /** Tabs sorted by the fallback in the last sort() (the dashboard sets this too). */
   lastFallbackCount = 0;
-  /** The last error from the model in the last sort, if any. */
+  /** The last error from the model in the last run, if any. */
   lastError: string | null = null;
-  /** Whether the user stopped the last sort before the model was done. */
-  stopped = false;
   private cache = new Map<string, { subject: string; target: SortTarget }>();
-  private lastSubjects = new Map<number, string>();
+  private failed = new Set<string>();
+  private skipped = new Set<string>();
+  private priority = new Set<string>();
+  private keys = new Map<number, string>();
 
   constructor(
     readonly model: Model,
@@ -211,130 +227,206 @@ export class ModelSorter implements Sorter {
     this.label = `Sorted by ${model.name}`;
   }
 
-  /**
-   * Forgets every remembered answer, so the next sort asks about all tabs again.
-   * Answers are otherwise kept, so suggestions don't shift while the user reviews them.
-   */
+  /** Whether the user stopped the model before it reached some tabs. */
+  get stopped(): boolean {
+    return this.skipped.size > 0;
+  }
+
+  /** Forgets every answer, failure and skip, so every tab is asked about again. */
   forget(): void {
     this.cache.clear();
+    this.failed.clear();
+    this.skipped.clear();
+    this.priority.clear();
   }
 
-  /** What the model said the tab is about, from the last sort. */
+  /** Forgets what is known about these tabs, and asks about them before any others. */
+  forgetTabs(tabs: TabInfo[]): void {
+    for (const t of tabs) {
+      const k = this.key(t);
+      this.cache.delete(k);
+      this.failed.delete(k);
+      this.skipped.delete(k);
+      this.priority.add(k);
+    }
+  }
+
+  /** What the model said the tab is about. */
   subjectOf(tabId: number): string | undefined {
-    return this.lastSubjects.get(tabId);
+    const k = this.keys.get(tabId);
+    return k ? this.cache.get(k)?.subject || undefined : undefined;
   }
 
-  async sort(input: SortInput, options: SortOptions = {}): Promise<Map<number, SortTarget>> {
-    const { signal, onProgress, onModel, stop } = options;
+  /** "answered", "failed", "skipped" (the user stopped the model) or "pending". */
+  statusOf(tab: TabInfo): "answered" | "failed" | "skipped" | "pending" {
+    const k = this.key(tab);
+    return this.cache.has(k) ? "answered" : this.failed.has(k) ? "failed" : this.skipped.has(k) ? "skipped" : "pending";
+  }
+
+  /** Tabs still to ask about, in the order they'll be asked: re-sort requests first, then by position. */
+  waiting(tabs: TabInfo[]): TabInfo[] {
+    return tabs
+      .filter((t) => this.statusOf(t) === "pending")
+      .sort((a, b) => Number(this.priority.has(this.key(b))) - Number(this.priority.has(this.key(a))) || byPosition(a, b));
+  }
+
+  results(tabs: TabInfo[]): SortResults {
+    const out: SortResults = { targets: new Map(), fallback: [], pending: [] };
+    for (const t of tabs) {
+      const hit = this.cache.get(this.key(t));
+      if (hit) out.targets.set(t.id, hit.target);
+      else if (this.statusOf(t) === "pending") out.pending.push(t);
+      else out.fallback.push(t);
+    }
+    return out;
+  }
+
+  private key(t: TabInfo): string {
+    const k = tabKey(t);
+    this.keys.set(t.id, k);
+    return k;
+  }
+
+  /**
+   * Asks the model about every waiting tab, batch by batch, until none are left.
+   * `getInput` is called before each batch, so tabs and groups may change meanwhile.
+   * Stopping (options.stop) keeps the answers so far and skips the rest.
+   */
+  async run(getInput: () => SortInput, options: RunOptions = {}): Promise<void> {
+    const { signal, onProgress, onModel, onAnswer, stop } = options;
     const modelSignal = stop && signal ? AbortSignal.any([signal, stop]) : (stop ?? signal);
     this.lastError = null;
-    this.stopped = false;
-    const siteLabels = new Set(
-      [...input.tabs, ...input.existingGroups.flatMap((g) => g.tabs)].map((t) => siteLabel(t.url)).filter((l): l is string => !!l),
-    );
-
-    const result = new Map<number, SortTarget>();
-    this.lastSubjects = new Map();
-    const todo: TabInfo[] = [];
-    for (const t of [...input.tabs].sort(byPosition)) {
-      const hit = this.cache.get(tabKey(t));
-      if (hit) {
-        result.set(t.id, hit.target);
-        if (hit.subject) this.lastSubjects.set(t.id, hit.subject);
-      } else todo.push(t);
-    }
-
-    const topics: string[] = [];
-    const addTopic = (name: string) => {
-      const found = topics.find((t) => normName(t) === normName(name));
-      if (found) return found;
-      topics.push(name);
-      return name;
-    };
-    for (const v of result.values()) if (v.kind === "new") addTopic(v.name);
-
-    let batch: TabInfo[] = [];
-    let offered: string[] = [];
-    let partial = "";
-    const useAnswers = (answers: Map<number, { subject: string; group: string }>) => {
-      batch.forEach((t, k) => {
-        const answer = answers.get(k + 1);
-        if (!answer) return;
-        let subject = answer.subject.trim().replace(/\s+/g, " ");
-        if (isSiteName(subject, siteLabels)) subject = cleanTitle(t.title, t.url);
-        subject = clip(subject, 60);
-        let target = resolveAnswer(answer.group, input, offered);
-        // A website name is not a topic: fall back to the subject, which still groups identical subjects.
-        if (target.kind === "new" && isSiteName(target.name, siteLabels)) target = { kind: "new", name: subject };
-        if (target.kind === "new") target = { kind: "new", name: addTopic(target.name) };
-        this.cache.set(tabKey(t), { subject, target });
-        this.lastSubjects.set(t.id, subject);
-        result.set(t.id, target);
-      });
-    };
-
-    onProgress?.(0, todo.length);
+    let done = 0;
     let size = this.model.maxBatch;
-    let i = 0;
-    while (i < todo.length) {
+    for (;;) {
       signal?.throwIfAborted();
-      if (stop?.aborted) break;
-      batch = todo.slice(i, i + size);
-      partial = "";
+      const input = getInput();
+      const todo = this.waiting(input.tabs);
+      if (stop?.aborted) {
+        for (const t of todo) this.skipped.add(this.key(t));
+        break;
+      }
+      onProgress?.(done, done + todo.length);
+      if (!todo.length) break;
+
+      const siteLabels = new Set(
+        [...input.tabs, ...input.existingGroups.flatMap((g) => g.tabs)].map((t) => siteLabel(t.url)).filter((l): l is string => !!l),
+      );
+      // Topics already given to tabs, in browser order.
+      const topics: string[] = [];
+      const addTopic = (name: string) => {
+        const found = topics.find((t) => normName(t) === normName(name));
+        if (found) return found;
+        topics.push(name);
+        return name;
+      };
+      for (const t of [...input.tabs].sort(byPosition)) {
+        const hit = this.cache.get(this.key(t));
+        if (hit?.target.kind === "new") addTopic(hit.target.name);
+      }
+
+      const request = (prompt: string): ModelRequest => ({ system: SYSTEM_PROMPT, prompt, schema: SCHEMA, signal: modelSignal });
+      let batch = todo.slice(0, size);
+      const used = new Set<number>();
+      let offered: string[] = [];
+      const useAnswers = (answers: Map<number, { subject: string; group: string }>) => {
+        let added = false;
+        batch.forEach((t, k) => {
+          const answer = answers.get(k + 1);
+          if (!answer || used.has(k)) return;
+          used.add(k);
+          let subject = answer.subject.trim().replace(/\s+/g, " ");
+          if (isSiteName(subject, siteLabels)) subject = cleanTitle(t.title, t.url);
+          subject = clip(subject, 60);
+          let target = resolveAnswer(answer.group, input, offered);
+          // A website name is not a topic: fall back to the subject, which still groups identical subjects.
+          if (target.kind === "new" && isSiteName(target.name, siteLabels)) target = { kind: "new", name: subject };
+          if (target.kind === "new") target = { kind: "new", name: addTopic(target.name) };
+          const key = this.key(t);
+          this.cache.set(key, { subject, target });
+          this.priority.delete(key);
+          added = true;
+        });
+        if (added) onAnswer?.();
+      };
+
       try {
-        const request = (prompt: string): ModelRequest => ({ system: SYSTEM_PROMPT, prompt, schema: SCHEMA, signal: modelSignal });
         let prompt = buildPrompt(input, topics, batch);
         while (batch.length > MIN_BATCH && !(await untilAborted(fits(this.model, request(prompt), batch.length), modelSignal))) {
           size = Math.max(MIN_BATCH, Math.floor(batch.length * 0.6));
-          batch = todo.slice(i, i + size);
+          batch = todo.slice(0, size);
           prompt = buildPrompt(input, topics, batch);
         }
         const ids: Record<string, string> = {};
         input.userGroups.forEach((g, n) => (ids[`U${n + 1}`] = g.name));
         input.existingGroups.forEach(({ group }, n) => (ids[`E${n + 1}`] = group.title || "Unnamed group"));
         topics.forEach((name, n) => (ids[`N${n + 1}`] = name));
-        onModel?.({ kind: "input", items: batch.map((t) => cleanTitle(t.title, t.url)), groups: ids });
+        onModel?.({ kind: "input", items: batch.map((t) => cleanTitle(t.title, t.url)), tabIds: batch.map((t) => t.id), groups: ids });
         offered = [...topics];
         const raw = await untilAborted(this.model.complete({
           ...request(prompt),
           onText: (text) => {
-            partial = text;
             onModel?.({ kind: "output", text });
+            useAnswers(parsePartialAnswer(text));
           },
           onStatus: (text) => onModel?.({ kind: "status", text }),
         }), modelSignal);
         useAnswers(parseAnswer(raw));
       } catch (e) {
         if (signal?.aborted) throw e;
-        if (stop?.aborted) {
-          // Keep the answers the model had finished before it was stopped.
-          useAnswers(parsePartialAnswer(partial));
-          this.stopped = true;
-          break;
-        }
+        if (stop?.aborted) continue; // Skips the rest at the top of the loop.
         this.lastError = e instanceof Error ? (e.name === "Error" ? e.message : `${e.name}: ${e.message}`) : String(e);
         onModel?.({ kind: "error", text: this.lastError });
         console.warn(`${this.model.name} couldn't sort a batch of tabs; sorting them by website.`, e);
       }
-      i += batch.length;
-      onProgress?.(i, todo.length);
+      // Tabs the model didn't answer for won't be asked about again until forgotten.
+      batch.forEach((t, k) => {
+        if (!used.has(k)) this.failed.add(this.key(t));
+      });
+      done += batch.length;
+      onProgress?.(done, done + this.waiting(getInput().tabs).length);
     }
-    if (stop?.aborted) this.stopped = true;
-
-    const missing = input.tabs.filter((t) => !result.has(t.id));
-    this.lastFallbackCount = missing.length;
-    if (missing.length) {
-      const fb = await this.fallback.sort({ ...input, tabs: missing }, { signal });
-      for (const [id, target] of fb) result.set(id, target);
-    }
-
-    // A topic needs at least two tabs to become a group.
-    const counts = new Map<string, number>();
-    for (const v of result.values()) if (v.kind === "new") counts.set(normName(v.name), (counts.get(normName(v.name)) ?? 0) + 1);
-    for (const [id, v] of result) if (v.kind === "new" && counts.get(normName(v.name))! < 2) result.set(id, { kind: "left" });
-    fillBetweenNeighbours(input.tabs, result);
-    return result;
   }
+
+  /** Sorts tabs in one go: the model's answers, the fallback for the rest, settled. */
+  async sort(input: SortInput, options: SortOptions = {}): Promise<Map<number, SortTarget>> {
+    await this.run(() => input, options);
+    const { targets, fallback, pending } = this.results(input.tabs);
+    const rest = [...fallback, ...pending];
+    this.lastFallbackCount = rest.length;
+    if (rest.length) {
+      const fb = await this.fallback.sort({ ...input, tabs: rest }, { signal: options.signal });
+      for (const [id, target] of fb) targets.set(id, target);
+    }
+    return settle(input.tabs, targets, true).targets;
+  }
+}
+
+/**
+ * Tidies a set of answers:
+ * - A topic needs at least two tabs to become a group. With `final`, a lone topic goes to Leftovers;
+ *   otherwise more tabs may still join it, so it is returned as `tentative` instead (tab id -> topic).
+ * - A leftover between two neighbours of the same group joins that group.
+ */
+export function settle(
+  tabs: TabInfo[],
+  answers: Map<number, SortTarget>,
+  final: boolean,
+): { targets: Map<number, SortTarget>; tentative: Map<number, string> } {
+  const targets = new Map(answers);
+  const tentative = new Map<number, string>();
+  const counts = new Map<string, number>();
+  for (const v of targets.values()) if (v.kind === "new") counts.set(normName(v.name), (counts.get(normName(v.name)) ?? 0) + 1);
+  for (const [id, v] of targets) {
+    if (v.kind !== "new" || counts.get(normName(v.name))! >= 2) continue;
+    if (final) targets.set(id, { kind: "left" });
+    else {
+      targets.delete(id);
+      tentative.set(id, v.name);
+    }
+  }
+  fillBetweenNeighbours(tabs, targets);
+  return { targets, tentative };
 }
 
 const sameTarget = (a: SortTarget, b: SortTarget) =>

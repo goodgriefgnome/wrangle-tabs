@@ -180,3 +180,5 @@ button.link:focus-visible { outline: 2px solid var(--cursor-edge); outline-offse
 .version { font-size: 12px; font-weight: 400; color: var(--muted); letter-spacing: 0; }
 
 .aibanner-text .errtext { color: var(--danger); overflow-wrap: anywhere; }
+.ready { font-size: 12px; font-weight: 600; color: var(--accent); white-space: nowrap; }
+.row.info.readyline { color: var(--accent); border: 1px dashed var(--accent); border-radius: 6px; margin: 4px 0; }

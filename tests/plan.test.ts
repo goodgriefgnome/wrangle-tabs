@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { buildPlan, type ManualTarget } from "../src/core/plan";
+import { buildPlan, sortAndPlan, sortInputFor, type ManualTarget } from "../src/core/plan";
 import { SiteSorter } from "../src/core/siteSorter";
 import type { Snapshot, UserGroup } from "../src/core/types";
 import { group, tab } from "./helpers";
 
 const sorter = new SiteSorter();
 const plan = (snapshot: Snapshot, userGroups: UserGroup[] = [], manual = new Map<number, ManualTarget>()) =>
-  buildPlan({ snapshot, userGroups, manual, sorter });
+  sortAndPlan({ snapshot, userGroups, manual }, sorter);
 
 describe("buildPlan", () => {
   it("adds tabs to the existing group that already holds their site", async () => {
@@ -104,5 +104,16 @@ describe("buildPlan", () => {
     const p = await plan({ tabs: [a, b], groups: [group({ id: 4, title: "React.dev" })], leftoversWindowId: null });
     expect(p.addToExisting).toEqual([{ groupId: 4, tabIds: [a.id, b.id] }]);
     expect(p.newGroups).toEqual([]);
+  });
+
+  it("lists tabs still waiting for the sorter, with their tentative topic", () => {
+    const a = tab({ url: "https://a.com/1" });
+    const b = tab({ url: "https://b.com/2" });
+    const c = tab({ url: "https://c.com/3" });
+    const input = { snapshot: { tabs: [a, b, c], groups: [], leftoversWindowId: null }, userGroups: [], manual: new Map() };
+    expect(sortInputFor(input).tabs.map((t) => t.id)).toEqual([a.id, b.id, c.id]);
+    const p = buildPlan(input, new Map([[a.id, { kind: "left" }]]), new Map([[b.id, "Baking"], [c.id, undefined]]));
+    expect(p.leftovers).toEqual([a.id]);
+    expect(p.unsorted).toEqual([{ tabId: b.id, topic: "Baking" }, { tabId: c.id, topic: undefined }]);
   });
 });

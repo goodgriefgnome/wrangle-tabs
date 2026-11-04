@@ -1,5 +1,5 @@
 import { findDuplicates } from "./duplicates";
-import type { Sorter, SortOptions } from "./sorter";
+import type { Sorter, SortInput, SortOptions, SortTarget } from "./sorter";
 import {
   GROUP_COLORS,
   type GroupColor,
@@ -42,6 +42,8 @@ export interface Plan {
   addToExisting: { groupId: number; tabIds: number[] }[];
   newGroups: NewGroupPlan[];
   leftovers: number[];
+  /** Tabs the sorter hasn't placed yet, with the topic they're heading for when it has only them so far. */
+  unsorted: { tabId: number; topic?: string }[];
 }
 
 export interface PlanInput {
@@ -50,16 +52,29 @@ export interface PlanInput {
   manual: Map<number, ManualTarget>;
   /** Renames and recolors of suggested ("ai:") groups. */
   aiOverrides?: Map<string, { name?: string; color?: GroupColor }>;
-  sorter: Sorter;
-  sortOptions?: SortOptions;
 }
 
 const byPosition = (a: TabInfo, b: TabInfo) => a.windowId - b.windowId || a.index - b.index;
 
-export async function buildPlan({ snapshot, userGroups, manual, aiOverrides, sorter, sortOptions }: PlanInput): Promise<Plan> {
-  const { tabs, groups, leftoversWindowId } = snapshot;
+/** Sorts the tabs that need it, then builds the plan, in one go. */
+export async function sortAndPlan(input: PlanInput, sorter: Sorter, options?: SortOptions): Promise<Plan> {
+  return buildPlan(input, await sorter.sort(sortInputFor(input), options));
+}
+
+/** What the sorter should look at: ungrouped tabs that aren't closing or placed by hand, and the groups. */
+export function sortInputFor(input: PlanInput): SortInput {
+  const { candidates, handPlaced } = prepare(input);
+  const { tabs, groups } = input.snapshot;
+  return {
+    tabs: candidates.filter((t) => !handPlaced.has(t.id)),
+    existingGroups: groups.map((group) => ({ group, tabs: tabs.filter((t) => t.groupId === group.id) })),
+    userGroups: input.userGroups,
+  };
+}
+
+function prepare({ snapshot, userGroups, manual }: PlanInput) {
+  const { tabs, groups } = snapshot;
   const found = findDuplicates(tabs, groups);
-  const notes = found.notes;
   // A duplicate the user moved somewhere else is kept open.
   const close: CloseItem[] = found.duplicates
     .filter((d) => !manual.has(d.closeId) || manual.get(d.closeId)!.kind === "close")
@@ -87,13 +102,24 @@ export async function buildPlan({ snapshot, userGroups, manual, aiOverrides, sor
     if (m.kind === "new" && m.key.startsWith("user:") && !userIds.has(m.key.slice(5))) continue;
     handPlaced.set(t.id, m);
   }
+  return { found, close, candidates, handPlaced, groupIds, userIds };
+}
 
+/**
+ * Builds the plan from the sorter's answers. Tabs with no answer go to Leftovers, or, when they're
+ * in `waiting` (tab id -> tentative topic, if any), to the unsorted list.
+ */
+export function buildPlan(
+  input: PlanInput,
+  sorted: Map<number, SortTarget>,
+  waiting: Map<number, string | undefined> = new Map(),
+): Plan {
+  const { snapshot, userGroups, aiOverrides } = input;
+  const { groups, leftoversWindowId } = snapshot;
+  const { found, close, candidates, handPlaced, groupIds, userIds } = prepare(input);
+  const notes = found.notes;
   const toSort = candidates.filter((t) => !handPlaced.has(t.id));
-  const sorted = await sorter.sort({
-    tabs: toSort,
-    existingGroups: groups.map((group) => ({ group, tabs: tabs.filter((t) => t.groupId === group.id) })),
-    userGroups,
-  }, sortOptions);
+  const unsorted: Plan["unsorted"] = [];
 
   const existing = new Map<number, number[]>();
   const fresh = new Map<string, number[]>();
@@ -110,6 +136,10 @@ export async function buildPlan({ snapshot, userGroups, manual, aiOverrides, sor
   const loose = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
   const existingByName = new Map(groups.filter((g) => g.title).map((g) => [loose(g.title), g.id]));
   for (const tab of toSort) {
+    if (!sorted.has(tab.id) && waiting.has(tab.id)) {
+      unsorted.push({ tabId: tab.id, topic: waiting.get(tab.id) });
+      continue;
+    }
     const s = sorted.get(tab.id) ?? { kind: "left" as const };
     if (s.kind === "existing" && groupIds.has(s.groupId)) place(tab, s);
     else if (s.kind === "user" && userIds.has(s.id)) place(tab, { kind: "new", key: `user:${s.id}` });
@@ -173,5 +203,6 @@ export async function buildPlan({ snapshot, userGroups, manual, aiOverrides, sor
       .map((g) => ({ groupId: g.id, tabIds: ordered(existing.get(g.id)!) })),
     newGroups,
     leftovers: ordered(leftovers),
+    unsorted,
   };
 }

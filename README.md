@@ -50,6 +50,10 @@ API keys are stored only in this browser and are never synced. The Gemini API ne
 
 The model decides from each tab and the current state of the groups (their names, and the tabs already in them), not from your earlier corrections. If it fails on some tabs, they're sorted by website, and the status line at the bottom says why. Answers are remembered per tab, so suggestions don't shift while you review them: re-scans only sort new tabs. Proposing or deleting a group, or pressing `R`, sorts everything again.
 
+**Results as they stream in.** Models are slow, so the list doesn't wait for them, and it doesn't change under you either. Tabs the AI hasn't placed yet sit in **Not sorted yet**. Answers that arrive wait off to the side: groups that will gain tabs show `+N ready`, new groups are listed in a dashed "Ready to pull in" line, and the banner counts them. Press `u` to pull them all in; groups grow in place and the cursor stays put. The first answers come in by themselves until you start moving around the list. Applying a group or re-scanning doesn't interrupt the AI; it picks up new tabs and the current groups before each batch. A topic with only one tab so far waits in Not sorted yet (marked with its topic and a "?") until the AI is done, since more tabs may join it.
+
+**Asking again.** `R` asks the AI again about the group under the cursor, the selected tabs, or everything. Those tabs go back to Not sorted yet and jump the queue; tabs you placed by hand stay put.
+
 ## Keys
 
 | Key | Action |
@@ -71,7 +75,8 @@ The model decides from each tab and the current state of the groups (their names
 | `/` | Filter |
 | Esc | Clear the selection, then the filter |
 | `r` | Re-scan tabs; only new tabs get sorted |
-| `R` | Re-sort all tabs from scratch |
+| `u` | Pull in the AI answers that have arrived |
+| `R` | Ask the AI again: the group under the cursor, the selected tabs, or everything |
 | `s` | AI settings |
 | `?` | All shortcuts |
 

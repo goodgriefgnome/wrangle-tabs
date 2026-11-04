@@ -3,6 +3,7 @@ import {
   buildPrompt,
   cleanTitle,
   fillBetweenNeighbours,
+  settle,
   ModelSorter,
   parseAnswer,
   resolveAnswer,
@@ -330,5 +331,75 @@ describe("ModelSorter stop", () => {
     // The one-tab topic goes to Leftovers; the unanswered tab is sorted by website.
     expect(res.get(t[0].id)).toEqual({ kind: "left" });
     expect(res.has(t[1].id)).toBe(true);
+  });
+});
+
+describe("ModelSorter run", () => {
+  it("stores answers as they stream in, and keeps going as tabs change", async () => {
+    const t = [tab({ url: "https://react.dev/a", title: "useEffect – React" }), tab({ url: "https://vite.dev/c", title: "Configuring Vite" })];
+    const late = tab({ url: "https://bake.com/r", title: "Rye sourdough loaf" });
+    let tabsNow = [...t];
+    const seen: number[] = [];
+    let sorter!: ModelSorter;
+    const model: Model = {
+      name: "streamer",
+      maxBatch: 30,
+      contextTokens: 100_000,
+      async complete(r) {
+        const lines = [...r.prompt.matchAll(/^(\d+)\. /gm)].map((m) => Number(m[1]));
+        const parts = lines.map((n) => `{"tab":${n},"subject":"s${n}","group":"Topic"}`);
+        let text = '{"tabs":[';
+        for (const p of parts) {
+          text += p + ",";
+          r.onText?.(text);
+        }
+        // A tab opened while the model was working.
+        tabsNow = [...t, late];
+        return text.replace(/,$/, "]}");
+      },
+    };
+    sorter = new ModelSorter(model);
+    await sorter.run(() => ({ tabs: tabsNow, existingGroups: [], userGroups: [] }), {
+      onAnswer: () => seen.push(sorter.results(tabsNow).targets.size),
+    });
+    expect(seen[0]).toBe(1); // The first answer was usable before the batch finished.
+    expect(sorter.results(tabsNow)).toMatchObject({ pending: [], fallback: [] });
+    expect(sorter.results(tabsNow).targets.size).toBe(3);
+  });
+
+  it("asks about forgotten tabs first, and skips the rest when stopped", async () => {
+    const t = [1, 2, 3].map((i) => tab({ url: `https://x.com/${i}`, title: `Some page number ${i}` }));
+    const prompts: string[] = [];
+    const stop = new AbortController();
+    const model: Model = {
+      name: "one at a time",
+      maxBatch: 1,
+      contextTokens: 100_000,
+      async complete(r) {
+        prompts.push(r.prompt);
+        if (prompts.length === 4) stop.abort();
+        return '{"tabs":[{"tab":1,"subject":"x","group":"none"}]}';
+      },
+    };
+    const sorter = new ModelSorter(model);
+    const input = { tabs: t, existingGroups: [], userGroups: [] };
+    await sorter.run(() => input);
+    sorter.forgetTabs([t[2]]);
+    sorter.forgetTabs([t[0]]);
+    // t[2] and t[0] are asked about again, before any other; stopping on the 2nd skips nothing else here.
+    await sorter.run(() => input, { stop: stop.signal });
+    expect(prompts[3]).toContain("Some page number 1");
+    expect(sorter.statusOf(t[1])).toBe("answered");
+    sorter.forgetTabs(t);
+    await sorter.run(() => input, { stop: stop.signal });
+    expect(sorter.stopped).toBe(true);
+    expect(sorter.results(t).fallback).toHaveLength(3);
+  });
+
+  it("settle keeps lone topics tentative until the sort is final", () => {
+    const [a, b] = [tab({ url: "https://a.com" }), tab({ url: "https://b.com" })];
+    const answers = new Map([[a.id, { kind: "new", name: "Baking" }]] as [number, import("../src/core/sorter").SortTarget][]);
+    expect(settle([a, b], answers, false)).toEqual({ targets: new Map(), tentative: new Map([[a.id, "Baking"]]) });
+    expect(settle([a, b], answers, true).targets.get(a.id)).toEqual({ kind: "left" });
   });
 });

@@ -4,10 +4,10 @@ import { takeSnapshot } from "../chrome/snapshot";
 import { missingSetting, modelFor, requestPermission, type AiChoice, type AiSettings, DEFAULT_AI_SETTINGS } from "../chrome/aiSettings";
 import { chromeAiStatus, downloadChromeAi, type ChromeAiStatus } from "../chrome/models/chromeAi";
 import { loadState, saveAiSettings, saveLeftoversWindowId, saveUserGroups } from "../chrome/storage";
-import { ModelSorter, parsePartialAnswer } from "../core/modelSorter";
-import { buildPlan, type ManualTarget, type NewGroupPlan, type Plan } from "../core/plan";
+import { ModelSorter, parsePartialAnswer, settle } from "../core/modelSorter";
+import { buildPlan, sortInputFor, type ManualTarget, type NewGroupPlan, type Plan, type PlanInput } from "../core/plan";
 import { SiteSorter } from "../core/siteSorter";
-import type { Sorter } from "../core/sorter";
+import type { Sorter, SortTarget } from "../core/sorter";
 import { GROUP_COLORS, type GroupColor, type GroupInfo, type Snapshot, type TabInfo, type UserGroup } from "../core/types";
 
 /* ---------------------------------------------------------------- state */
@@ -16,9 +16,27 @@ const siteSorter = new SiteSorter();
 /** The AI sorter for the current settings; rebuilt when they change, which also drops its remembered answers. */
 let modelSorter: ModelSorter | null = null;
 
+/** AI answers that have arrived but aren't shown yet: per block, and new blocks per section. */
+interface Ready {
+  total: number;
+  byBlock: Map<string, number>;
+  ghosts: Map<SectionKey, string[]>;
+}
+const NO_READY: Ready = { total: 0, byBlock: new Map(), ghosts: new Map() };
+
 const S = {
   snapshot: null as Snapshot | null,
+  /** The plan on screen: only the AI answers the user has pulled in. */
   plan: null as Plan | null,
+  /** The plan with every AI answer that has arrived. */
+  arrived: null as Plan | null,
+  ready: NO_READY,
+  /** Tabs whose AI answers are shown. */
+  pulled: new Set<number>(),
+  /** Tabs the AI (or the fallback) has an answer for. */
+  answered: [] as number[],
+  /** Pull answers in as they arrive, until the user starts reviewing. */
+  autoPull: true,
   userGroups: [] as UserGroup[],
   leftoversWindowId: null as number | null,
   /** Tabs the user moved by hand. Re-sorting leaves them where they were put. */
@@ -39,8 +57,9 @@ const S = {
     total: number;
     /** When the current batch went to the model. */
     batchStart?: number;
-    /** Titles in the current batch, the group ids the model may use, and its answer so far. */
+    /** Titles and tabs in the current batch, the group ids the model may use, and its answer so far. */
     input?: string[];
+    tabIds?: number[];
     groupIds?: Record<string, string>;
     output?: string;
     error?: string;
@@ -125,7 +144,7 @@ function toast(msg: string) {
 
 /* ---------------------------------------------------------------- rows */
 
-type SectionKey = "close" | "existing" | "new" | "left";
+type SectionKey = "close" | "existing" | "new" | "left" | "wait";
 
 /** A group of suggestions you review and apply as a whole. */
 interface Block {
@@ -138,7 +157,7 @@ interface Block {
 
 type Row =
   | { type: "section"; section: SectionKey; count: number }
-  | { type: "info"; text: string }
+  | { type: "info"; text: string; ready?: boolean }
   | { type: "block"; key: string; block: Block }
   | { type: "item"; key: string; section: SectionKey; block: Block; tabId: number };
 
@@ -150,8 +169,9 @@ const SECTIONS: Record<SectionKey, { title: string; hint: string }> = {
     hint: "Created in the window that already holds most of their tabs. Press n to propose your own.",
   },
   left: { title: "Leftovers", hint: "Tabs that don't fit a group go to one window." },
+  wait: { title: "Not sorted yet", hint: "The AI hasn't placed these yet. Press u to pull in its answers as they arrive." },
 };
-const SECTION_ORDER: SectionKey[] = ["close", "existing", "new", "left"];
+const SECTION_ORDER: SectionKey[] = ["close", "existing", "new", "left", "wait"];
 
 const itemKey = (blockKey: string, tabId: number) => `${blockKey}|${tabId}`;
 
@@ -166,7 +186,33 @@ function blocksOf(plan: Plan): Block[] {
     })),
     ...plan.newGroups.map((g) => ({ key: `new:${g.key}`, section: "new" as const, newGroup: g, tabIds: g.tabIds })),
     { key: "left", section: "left", tabIds: plan.leftovers },
+    { key: "wait", section: "wait", tabIds: plan.unsorted.map((u) => u.tabId) },
   ];
+}
+
+/** What pulling in would change: arrived answers that land somewhere other than where the tab is shown. */
+function computeReady(shown: Plan, arrived: Plan): Ready {
+  const where = (plan: Plan) => {
+    const m = new Map<number, string>();
+    for (const b of blocksOf(plan)) for (const id of b.tabIds) m.set(id, b.key);
+    return m;
+  };
+  const was = where(shown);
+  const byBlock = new Map<string, number>();
+  let total = 0;
+  for (const [id, key] of where(arrived)) {
+    if (key === "wait" || was.get(id) === key) continue;
+    total++;
+    byBlock.set(key, (byBlock.get(key) ?? 0) + 1);
+  }
+  const visible = new Set(blocksOf(shown).filter((b) => b.tabIds.length || b.newGroup?.mine).map((b) => b.key));
+  const ghosts = new Map<SectionKey, string[]>();
+  for (const b of blocksOf(arrived)) {
+    const n = byBlock.get(b.key);
+    if (!n || visible.has(b.key)) continue;
+    ghosts.set(b.section, [...(ghosts.get(b.section) ?? []), `${blockName(b)} (${n})`]);
+  }
+  return { total, byBlock, ghosts };
 }
 
 let rows: Row[] = [];
@@ -181,6 +227,8 @@ function buildRows(plan: Plan): Row[] {
         b.section === section &&
         (S.filter ? b.tabIds.some(matches) : b.tabIds.length > 0 || b.newGroup?.mine),
     );
+    const ghosts = S.filter ? [] : (S.ready.ghosts.get(section) ?? []);
+    if (section === "wait" && !bs.length && !ghosts.length) continue;
     out.push({ type: "section", section, count: bs.reduce((n, b) => n + b.tabIds.length, 0) });
     for (const b of bs) {
       out.push({ type: "block", key: b.key, block: b });
@@ -190,7 +238,8 @@ function buildRows(plan: Plan): Row[] {
       if (b.newGroup?.mine && !b.tabIds.length) out.push({ type: "info", text: "No matching tabs yet. Move tabs here with m." });
     }
     if (section === "close" && !S.filter) for (const text of plan.notes) out.push({ type: "info", text });
-    if (!bs.length) out.push({ type: "info", text: S.filter ? "No matches." : "Nothing to do here." });
+    if (ghosts.length) out.push({ type: "info", ready: true, text: `Ready to pull in: ${ghosts.join(", ")}. Press u.` });
+    else if (!bs.length) out.push({ type: "info", text: S.filter ? "No matches." : "Nothing to do here." });
   }
   return out;
 }
@@ -210,6 +259,7 @@ function blockWindow(b: Block): number | null {
 function blockName(b: Block): string {
   if (b.section === "close") return "Close";
   if (b.section === "left") return "Leftovers window";
+  if (b.section === "wait") return "Not sorted yet";
   if (b.groupId !== undefined) return groups.get(b.groupId)?.title || "Unnamed group";
   return b.newGroup!.name;
 }
@@ -220,6 +270,7 @@ function applyLabel(b: Block): string {
   const tabsWord = `${n} ${n === 1 ? "tab" : "tabs"}`;
   if (b.section === "close") return `Close ${tabsWord}`;
   if (b.section === "left") return `Move ${tabsWord} to Leftovers`;
+  if (b.section === "wait") return "Waiting for the AI";
   if (b.section === "existing") return `Add ${tabsWord} to “${blockName(b)}”`;
   return `Create “${blockName(b)}”`;
 }
@@ -238,7 +289,7 @@ function rowHTML(r: Row): string {
     const s = SECTIONS[r.section];
     return `<div class="sec"><h2>${s.title}</h2><span class="count">${r.count} ${r.count === 1 ? "tab" : "tabs"}</span><span class="hint">${s.hint}</span></div>`;
   }
-  if (r.type === "info") return `<div class="row info">${esc(r.text)}</div>`;
+  if (r.type === "info") return `<div class="row info${r.ready ? " readyline" : ""}">${esc(r.text)}</div>`;
   const cur = r.key === S.cursor ? " cur" : "";
 
   if (r.type === "block") {
@@ -251,6 +302,8 @@ function rowHTML(r: Row): string {
     const win = blockWindow(b);
     if (b.section === "close") {
       name = `<span class="chip closechip">Close</span>`;
+    } else if (b.section === "wait") {
+      name = `<span class="chip ghost">Waiting for the AI</span>`;
     } else if (b.section === "left") {
       name = `<span class="chip ghost">Leftovers window</span>`;
       meta = `<span class="win">${win !== null ? winShort(win) : "new window"}</span>`;
@@ -267,8 +320,10 @@ function rowHTML(r: Row): string {
       hint = g.hint;
       meta = (g.mine ? `<span class="chip ghost">yours</span>` : "") + `<span class="win">new${win !== null ? " · " + winShort(win) : ""}</span>`;
     }
+    const ready = S.ready.byBlock.get(b.key);
+    if (ready) meta += `<span class="ready">+${ready} ready</span>`;
     const isCurBlock = curBlock()?.key === b.key;
-    const apply = b.tabIds.length
+    const apply = b.tabIds.length && b.section !== "wait"
       ? `<button type="button" class="applybtn${isCurBlock ? " primary" : ""}" data-apply="${esc(b.key)}">${esc(applyLabel(b))}${isCurBlock ? "<kbd>⇧↵</kbd>" : ""}</button>`
       : "";
     return `<div class="row block on-row${cur}" id="${rowId(r.key)}" data-key="${esc(r.key)}" role="option" aria-selected="${st === "on"}">${caret}<span class="cb ${st}" data-cb></span>${name}<span class="title hintx">${esc(hint)}</span>${meta}${apply}</div>`;
@@ -285,6 +340,16 @@ function rowHTML(r: Row): string {
       ? `duplicate · keeps ${winShort(k.windowId)}${k.pinned ? " pinned" : ""}${k.groupId !== -1 ? " " + esc(groups.get(k.groupId)?.title || "group") : ""}`
       : "marked by you";
     tail = `<span class="win">${winShort(t.windowId)} · ${why}</span>`;
+  } else if (r.section === "wait") {
+    const topic = S.plan!.unsorted.find((u) => u.tabId === r.tabId)?.topic;
+    const state = S.answered.includes(r.tabId) && !S.pulled.has(r.tabId)
+      ? `<span class="mv">ready</span>`
+      : topic
+        ? `→ “${esc(topic)}”?`
+        : S.sorting?.tabIds?.includes(r.tabId)
+          ? "reading…"
+          : "waiting";
+    tail = `<span class="win">${winShort(t.windowId)} · ${state}</span>`;
   } else {
     const target = blockWindow(r.block);
     tail =
@@ -314,7 +379,7 @@ function render() {
   if (!nav.some((r) => r.key === S.cursor)) {
     S.cursor = nav.length ? nav[Math.min(S.lastIdx, nav.length - 1)].key : null;
   }
-  listEl.innerHTML = rows.map(rowHTML).join("");
+  setHTML(listEl, rows.map(rowHTML).join(""));
   if (S.cursor) {
     listEl.setAttribute("aria-activedescendant", rowId(S.cursor));
     document.getElementById(rowId(S.cursor))?.scrollIntoView({ block: "nearest" });
@@ -335,7 +400,7 @@ function renderStats() {
   const windows = new Set(all.map((t) => t.windowId));
   const ungrouped = all.filter((t) => t.groupId === -1 && t.windowId !== S.leftoversWindowId).length;
   const toClose = S.plan?.close.length ?? 0;
-  const toReview = S.plan ? blocksOf(S.plan).filter((b) => b.tabIds.length).length : 0;
+  const toReview = S.plan ? blocksOf(S.plan).filter((b) => b.tabIds.length && b.section !== "wait").length : 0;
   $("#stats").innerHTML =
     `<span><b>${all.length}</b> tabs</span><span><b>${windows.size}</b> windows</span>` +
     `<span class="warn"><b>${ungrouped}</b> ungrouped</span><span><b>${toClose}</b> to close</span>` +
@@ -379,12 +444,15 @@ function renderSummary() {
   const b = curBlock();
   $("#summary").innerHTML = n
     ? `<b>${n}</b> ${n === 1 ? "tab" : "tabs"} selected · <kbd>m</kbd> move · <kbd>#</kbd> close · <kbd>esc</kbd> clear`
-    : b?.tabIds.length
+    : b?.section === "wait"
+      ? "These tabs are waiting for the AI. You can still move them yourself with m."
+      : b?.tabIds.length
       ? `Looks right? <kbd>⇧↵</kbd> applies “${esc(blockName(b))}”.`
       : "Move the cursor to a group to review it.";
   const apply = $<HTMLButtonElement>("#apply");
-  apply.disabled = !b?.tabIds.length || S.busy;
-  apply.innerHTML = `${b?.tabIds.length ? esc(applyLabel(b)) : "Apply group"}<kbd>⇧↵</kbd>`;
+  const can = !!b?.tabIds.length && b.section !== "wait";
+  apply.disabled = !can || S.busy;
+  apply.innerHTML = `${can ? esc(applyLabel(b!)) : "Apply group"}<kbd>⇧↵</kbd>`;
 }
 
 function renderStatusLine() {
@@ -428,15 +496,25 @@ function whyNoAi(): string | null {
 
 /** One line on how the current tab was sorted, for checking the AI's work. */
 function sortExplanation(tabId: number): string {
+  if (S.manual.has(tabId)) return "Placed by you. Press m and choose “Let the sorter decide” to undo.";
   const sorter = activeSorter();
   if (!(sorter instanceof ModelSorter)) return `Sorted by website: ${whyNoAi()}.`;
-  const subject = sorter.subjectOf(tabId);
-  if (!subject) {
-    if (sorter.stopped) return "AI: stopped before it reached this tab, so it was sorted by website. Press R to sort everything again.";
-    const err = sorter.lastError;
-    return `AI: no answer for this tab, so it was sorted by website.${err ? ` Error: ${err}` : ""}`;
+  const t = tabs.get(tabId);
+  if (!t) return "";
+  const status = sorter.statusOf(t);
+  if (status === "answered") {
+    const about = `AI: about “${sorter.subjectOf(tabId) ?? "?"}”`;
+    if (!S.pulled.has(tabId)) return `${about}. Its answer is ready: press u to pull it in.`;
+    const topic = S.plan?.unsorted.find((u) => u.tabId === tabId)?.topic;
+    if (topic) return `${about}, heading for “${topic}”, which has no other tabs yet. It goes to Leftovers if none join.`;
+    return about;
   }
-  return `AI: about “${subject}”`;
+  if (status === "skipped") return "AI: stopped before it reached this tab, so it was sorted by website. Press R to ask again.";
+  if (status === "failed") {
+    const err = sorter.lastError;
+    return `AI: no answer for this tab, so it was sorted by website. Press R to ask again.${err ? ` Error: ${err}` : ""}`;
+  }
+  return S.sorting?.tabIds?.includes(tabId) ? "The AI is reading this tab now." : "Waiting for the AI.";
 }
 
 /* ---------------------------------------------------------------- data */
@@ -456,7 +534,7 @@ async function rescan() {
     const t = tabs.get(id);
     if (!t || t.groupId !== -1) S.manual.delete(id);
   }
-  await replan();
+  await refresh();
 }
 
 function activeSorter(): Sorter {
@@ -468,59 +546,194 @@ function activeSorter(): Sorter {
   return modelSorter ?? siteSorter;
 }
 
-let replanGeneration = 0;
-let replanAbort: AbortController | null = null;
-/** Stops the AI sort that's running; the rest of the tabs get sorted by website. */
-let replanStop: AbortController | null = null;
+function planInput(): PlanInput {
+  return { snapshot: S.snapshot!, userGroups: S.userGroups, manual: S.manual, aiOverrides: S.aiOverrides };
+}
 
-/** Re-sorts. A newer call cancels an older one that is still running. */
-async function replan() {
-  if (!S.snapshot) return;
-  const generation = ++replanGeneration;
-  replanAbort?.abort();
-  const abort = new AbortController();
-  replanAbort = abort;
-  const stop = new AbortController();
-  replanStop = stop;
-  const current = () => generation === replanGeneration;
-  try {
-    const plan = await buildPlan({
-      snapshot: S.snapshot,
-      userGroups: S.userGroups,
-      manual: S.manual,
-      aiOverrides: S.aiOverrides,
-      sorter: activeSorter(),
-      sortOptions: {
-        signal: abort.signal,
-        stop: stop.signal,
-        onProgress: (done, total) => {
-          if (!current() || total === 0) return;
-          S.sorting = { ...S.sorting, done, total };
-          if (S.plan) {
-            renderSorter();
-            renderSummary();
-          } else render();
-        },
-        onModel: (event) => {
-          if (!current() || !S.sorting) return;
-          if (event.kind === "input")
-            Object.assign(S.sorting, { input: event.items, groupIds: event.groups, output: "", error: undefined, status: undefined, batchStart: Date.now() });
-          else if (event.kind === "output") Object.assign(S.sorting, { output: event.text, status: undefined });
-          else if (event.kind === "status") S.sorting.status = event.text;
-          else S.sorting.error = event.text;
-          renderBanner();
-        },
+/**
+ * The AI run working through the tabs, if one is going. It keeps going across re-scans and
+ * applies, picking up new tabs and the current groups before each batch.
+ */
+let job: { sorter: ModelSorter; abort: AbortController; stop: AbortController } | null = null;
+/** Sorters whose run broke unexpectedly; not restarted until asked to re-sort. */
+const crashed = new WeakSet<ModelSorter>();
+
+function cancelJob() {
+  if (!job) return;
+  job.abort.abort();
+  job = null;
+  S.sorting = null;
+}
+
+/** Starts an AI run when there are tabs waiting for one and none is going. */
+function ensureSorting() {
+  const sorter = activeSorter();
+  if (!(sorter instanceof ModelSorter) || !S.snapshot) return cancelJob();
+  if (job?.sorter === sorter) return;
+  cancelJob();
+  if (crashed.has(sorter) || !sorter.waiting(sortInputFor(planInput()).tabs).length) return;
+  const me = { sorter, abort: new AbortController(), stop: new AbortController() };
+  job = me;
+  S.sorting = { done: 0, total: 0 };
+  const mine = () => job === me;
+  sorter
+    .run(() => sortInputFor(planInput()), {
+      signal: me.abort.signal,
+      stop: me.stop.signal,
+      onProgress: (done, total) => {
+        if (!mine() || !S.sorting) return;
+        Object.assign(S.sorting, { done, total });
+        renderSorter();
       },
+      onModel: (event) => {
+        if (!mine() || !S.sorting) return;
+        if (event.kind === "input")
+          Object.assign(S.sorting, { input: event.items, tabIds: event.tabIds, groupIds: event.groups, output: "", error: undefined, status: undefined, batchStart: Date.now() });
+        else if (event.kind === "output") Object.assign(S.sorting, { output: event.text, status: undefined });
+        else if (event.kind === "status") S.sorting.status = event.text;
+        else S.sorting.error = event.text;
+        renderBanner();
+      },
+      onAnswer: () => {
+        if (mine()) scheduleRefresh();
+      },
+    })
+    .catch((e) => {
+      if (me.abort.signal.aborted) return;
+      crashed.add(sorter);
+      console.error(e);
+      toast(`The AI run broke: ${e instanceof Error ? e.message : String(e)}`);
+    })
+    .finally(() => {
+      if (!mine()) return;
+      job = null;
+      S.sorting = null;
+      void refresh();
     });
-    if (!current()) return;
-    S.plan = plan;
-  } catch (e) {
-    if (abort.signal.aborted) return;
-    throw e;
-  } finally {
-    if (current()) S.sorting = null;
+}
+
+let refreshTimer = 0;
+/** Refreshes soon, at most a few times a second, while answers stream in. */
+function scheduleRefresh() {
+  if (refreshTimer) return;
+  refreshTimer = window.setTimeout(() => {
+    refreshTimer = 0;
+    void refresh();
+  }, 400);
+}
+
+let refreshGeneration = 0;
+
+/**
+ * Rebuilds the plan on screen (with the AI answers pulled in so far) and the plan with every
+ * answer that has arrived, and starts the AI on tabs that are waiting for it.
+ */
+async function refresh() {
+  if (!S.snapshot) return;
+  const generation = ++refreshGeneration;
+  const input = planInput();
+  const sortInput = sortInputFor(input);
+  const sorter = activeSorter();
+  if (!(sorter instanceof ModelSorter)) {
+    cancelJob();
+    const sorted = await sorter.sort(sortInput);
+    if (generation !== refreshGeneration) return;
+    S.plan = buildPlan(input, sorted);
+    S.arrived = null;
+    S.answered = [];
+  } else {
+    ensureSorting();
+    const running = job !== null;
+    const r = sorter.results(sortInput.tabs);
+    // With no run going, tabs still waiting can't get an answer: sort them by website too.
+    const fallbackTabs = running ? r.fallback : [...r.fallback, ...r.pending];
+    const fb = fallbackTabs.length ? await siteSorter.sort({ ...sortInput, tabs: fallbackTabs }) : new Map<number, SortTarget>();
+    if (generation !== refreshGeneration) return;
+    sorter.lastFallbackCount = fallbackTabs.length;
+    const all = new Map([...r.targets, ...fb]);
+    S.answered = [...all.keys()];
+    if (S.autoPull) for (const id of S.answered) S.pulled.add(id);
+    const view = (answers: Map<number, SortTarget>) => {
+      // Lone topics only go to Leftovers once no more tabs can join them.
+      const { targets, tentative } = settle(sortInput.tabs, answers, !running && answers.size === all.size);
+      const waiting = new Map<number, string | undefined>();
+      for (const t of sortInput.tabs) if (!targets.has(t.id)) waiting.set(t.id, tentative.get(t.id));
+      return buildPlan(input, targets, waiting);
+    };
+    S.plan = view(new Map([...all].filter(([id]) => S.pulled.has(id))));
+    S.arrived = view(all);
   }
+  S.ready = S.arrived ? computeReady(S.plan, S.arrived) : NO_READY;
   render();
+}
+
+/** u: shows every AI answer that has arrived. The cursor stays put, or moves to the next row that stayed. */
+async function pull() {
+  if (!S.ready.total) return toast(S.sorting ? "Nothing new yet. The AI is still working." : "Nothing new to pull in.");
+  const n = S.ready.total;
+  const was = S.cursor;
+  const before = navRows().map((r) => r.key);
+  const at = before.indexOf(was ?? "");
+  const r = curRow();
+  const follow = r?.type === "item" && r.section !== "wait" ? r.tabId : null;
+  for (const id of S.answered) S.pulled.add(id);
+  await refresh();
+  const now = navRows();
+  if (!now.some((x) => x.key === was)) {
+    const same = follow !== null ? now.find((x) => x.type === "item" && x.tabId === follow) : undefined;
+    const keys = new Set(now.map((x) => x.key));
+    const next = same?.key ?? before.slice(at + 1).find((k) => keys.has(k)) ?? before.slice(0, Math.max(0, at)).reverse().find((k) => keys.has(k));
+    if (next) {
+      setCursor(next);
+      render();
+    }
+  }
+  toast(`Pulled in ${n} ${n === 1 ? "answer" : "answers"}.`);
+}
+
+/** Forgets every AI answer and sorts all tabs again; answers come in as they arrive. */
+function resortAll() {
+  if (modelSorter) {
+    cancelJob();
+    modelSorter.forget();
+  }
+  S.pulled.clear();
+  S.autoPull = true;
+  void refresh();
+}
+
+/** Asks the AI again about some tabs, ahead of any others. Tabs placed by hand stay put. */
+function resortTabs(ids: number[]) {
+  const sorter = activeSorter();
+  if (!(sorter instanceof ModelSorter)) return toast(`Re-sorting asks the AI again, but ${whyNoAi()}.`);
+  const list = ids.map((id) => tabs.get(id)).filter((t): t is TabInfo => !!t && !S.manual.has(t.id));
+  if (!list.length) return toast("Nothing to re-sort: you placed these tabs yourself.");
+  sorter.forgetTabs(list);
+  for (const t of list) S.pulled.delete(t.id);
+  void refresh();
+  toast(`Asking the AI again about ${list.length} ${list.length === 1 ? "tab" : "tabs"}. Press u when the answers are in.`);
+}
+
+/** R: re-sort the selection, the group under the cursor, or everything. */
+function openResort() {
+  const opts: Option[] = [];
+  if (S.selected.size) {
+    const ids = [...S.selected];
+    opts.push({ label: `Selected tabs`, meta: `${ids.length}`, go: () => {
+      S.selected.clear();
+      resortTabs(ids);
+    } });
+  }
+  const b = curBlock();
+  if (b && b.section !== "close" && b.section !== "wait" && b.tabIds.length) {
+    const ids = b.tabIds.filter((id) => !S.manual.has(id));
+    if (ids.length) opts.push({ label: blockName(b), color: b.newGroup?.color ?? (b.groupId !== undefined ? groups.get(b.groupId)?.color : undefined), meta: `${ids.length} ${ids.length === 1 ? "tab" : "tabs"}`, go: () => resortTabs(ids) });
+  }
+  opts.push({ label: "Everything", meta: "forgets all AI answers", go: () => {
+    resortAll();
+    toast("Sorting all tabs again.");
+  } });
+  openPicker("Ask the AI again about…", opts);
 }
 
 /** Complete `{ tab, subject, group }` answers in a partly streamed model answer, in order. */
@@ -568,9 +781,12 @@ function renderBanner() {
     text =
       `<strong>Sorting with ${esc(name)}… ${done} of ${p.total} tabs</strong>` +
       `<span>${p.input ? `This batch: ${p.input.length} tabs, ${secs} s so far` : "Starting the model…"}</span>`;
+    const n = S.ready.total;
+    if (n) text += `<span>${n} ${n === 1 ? "answer is" : "answers are"} ready to pull in.</span>`;
     actions =
       `<button type="button" data-act="settings">AI settings</button>` +
-      `<button type="button" data-act="stop" title="The tabs not sorted yet are sorted by website">Stop</button>`;
+      `<button type="button" data-act="stop" title="The tabs not sorted yet are sorted by website">Stop</button>` +
+      (n ? `<button type="button" class="primary" data-act="pull">Pull in ${n}<kbd>u</kbd></button>` : "");
     extra =
       bar(pct) +
       (p.input
@@ -578,6 +794,10 @@ function renderBanner() {
           outLines.map((line, i) => `<div><span class="dir">${i === 0 ? "out" : ""}</span>${line}</div>`).join("") +
           `</div>`
         : "");
+  } else if (S.ready.total) {
+    const n = S.ready.total;
+    text = `<strong>The AI is done: ${n} ${n === 1 ? "answer is" : "answers are"} ready to pull in</strong><span>They're shown in the list once you pull them in.</span>`;
+    actions = `<button type="button" class="primary" data-act="pull">Pull in ${n}<kbd>u</kbd></button>`;
   } else if (S.download !== null) {
     const pct = Math.round(S.download * 100);
     text =
@@ -629,12 +849,15 @@ function onAiAction(e: Event) {
   const act = (e.target as HTMLElement).closest<HTMLElement>("[data-act]")?.dataset.act;
   if (act === "download") void startDownload();
   else if (act === "settings") openAiSettings();
+  else if (act === "pull") void pull();
   else if (act === "retry") {
-    modelSorter?.forget();
-    void rescan();
+    const sorter = activeSorter();
+    if (sorter instanceof ModelSorter && S.snapshot) {
+      resortTabs(sortInputFor(planInput()).tabs.filter((t) => sorter.statusOf(t) === "failed").map((t) => t.id));
+    }
   }
   else if (act === "stop") {
-    replanStop?.abort();
+    job?.stop.abort();
     toast("Stopped. The tabs the AI hadn't reached are sorted by website.");
   }
 }
@@ -664,10 +887,12 @@ function renderSorter() {
 async function setAiSettings(ai: AiSettings) {
   S.ai = ai;
   modelSorter = null;
+  S.pulled.clear();
+  S.autoPull = true;
   await saveAiSettings(ai);
   if (ai.choice === "chrome") S.aiStatus = await chromeAiStatus();
   renderSorter();
-  await replan();
+  await refresh();
 }
 
 /** `resume` joins a download that is already running, without asking for a click. */
@@ -685,8 +910,10 @@ async function startDownload(resume = false) {
     S.aiStatus = await chromeAiStatus();
     // Only re-sort; never change the choice, which the user may have changed meanwhile.
     modelSorter = null;
+    S.pulled.clear();
+    S.autoPull = true;
     renderSorter();
-    await replan();
+    await refresh();
   } catch (e) {
     S.download = null;
     S.aiStatus = await chromeAiStatus();
@@ -832,7 +1059,7 @@ async function moveTabs(ids: number[], target: ManualTarget) {
   const next = nav.slice(at).find(stays) ?? nav.slice(0, at).reverse().find(stays);
   for (const id of ids) S.manual.set(id, target);
   S.selected.clear();
-  await replan();
+  await refresh();
   if (next && navRows().some((r) => r.key === next.key)) {
     setCursor(next.key);
     render();
@@ -847,7 +1074,7 @@ async function markClose() {
   if (marked.length === ids.length) {
     for (const id of ids) S.manual.delete(id);
     S.selected.clear();
-    await replan();
+    await refresh();
     toast(`Unmarked ${ids.length} ${ids.length === 1 ? "tab" : "tabs"}.`);
     return;
   }
@@ -889,7 +1116,7 @@ async function updateNewGroup(g: NewGroupPlan, change: { name?: string; color?: 
   } else {
     S.aiOverrides.set(g.key, { ...S.aiOverrides.get(g.key), ...change });
   }
-  await replan();
+  await refresh();
 }
 
 function startRename() {
@@ -947,8 +1174,7 @@ async function deleteUserGroup() {
   S.userGroups = S.userGroups.filter((u) => u.id !== id);
   for (const [tabId, m] of S.manual) if (m.kind === "new" && m.key === g.key) S.manual.delete(tabId);
   await saveUserGroups(S.userGroups);
-  modelSorter?.forget();
-  await replan();
+  resortAll();
   toast(`Deleted “${g.name}”. Its tabs went back to the suggestions.`);
 }
 
@@ -979,8 +1205,8 @@ interface Option {
 function openPicker(title: string, opts: Option[]) {
   let q = "";
   let idx = 0;
-  showOverlay(`<div class="dialog" role="dialog" aria-modal="true" aria-label="Move tab">
-    <header>${title}<small>Type to filter · ↑↓ to choose · Enter to move · Esc to cancel</small></header>
+  showOverlay(`<div class="dialog" role="dialog" aria-modal="true" aria-label="${title.replace(/<[^>]*>|"/g, "")}">
+    <header>${title}<small>Type to filter · ↑↓ to choose · Enter to pick · Esc to cancel</small></header>
     <input id="picker-q" placeholder="Group name" autocomplete="off" aria-label="Filter groups">
     <div class="opts" id="picker-opts" role="listbox"></div></div>`);
   const input = $<HTMLInputElement>("#picker-q");
@@ -1073,7 +1299,7 @@ function openMove() {
       go: async () => {
         for (const id of ids) S.manual.delete(id);
         S.selected.clear();
-        await replan();
+        await refresh();
       },
     });
   }
@@ -1097,12 +1323,12 @@ function openPropose() {
     closeModal();
     const g = await addUserGroup(name, hint);
     // Sort every tab again, so the new group can collect the tabs that fit it.
-    modelSorter?.forget();
-    await replan();
+    resortAll();
+    await refresh();
     setCursor(`new:user:${g.id}`);
     render();
     const n = S.plan!.newGroups.find((x) => x.key === `user:${g.id}`)?.tabIds.length ?? 0;
-    toast(n ? `${n} tab${n > 1 ? "s" : ""} sorted into “${name}”.` : `Added “${name}”. No tabs matched yet.`);
+    toast(job ? `Added “${name}”. The AI is sorting your tabs again to fill it.` : n ? `${n} tab${n > 1 ? "s" : ""} sorted into “${name}”.` : `Added “${name}”. No tabs matched yet.`);
   };
   S.modal = (e) => {
     if (e.key === "Escape") closeModal();
@@ -1117,6 +1343,7 @@ function openPropose() {
 
 /** Shift+Enter: carries out the group under the cursor, as reviewed. */
 async function applyGroup(b = curBlock()) {
+  if (b?.section === "wait") return toast("These tabs are waiting for the AI. Move them yourself with m, or wait.");
   if (!b || !b.tabIds.length) return toast("Put the cursor on a group with tabs to apply it.");
   if (S.busy) return;
   S.busy = true;
@@ -1164,8 +1391,9 @@ function openHelp() {
     [["↵"], "Switch to that tab"],
     [["y"], "Copy the tab's full URL"],
     [["/"], "Filter"],
+    [["u"], "Pull in the AI answers that have arrived"],
     [["r"], "Re-scan tabs (only new tabs are sorted)"],
-    [["R"], "Re-sort all tabs from scratch"],
+    [["R"], "Ask the AI again: the group under the cursor, the selected tabs, or everything"],
     [["s"], "AI settings"],
     [["⇧", "↵"], "Apply the group under the cursor"],
     [["esc"], "Clear selection / filter"],
@@ -1219,6 +1447,8 @@ document.addEventListener("keydown", (e) => {
     return;
   }
   if (!S.plan) return;
+  // Once AI answers are on screen and the user starts working through them, new ones wait for u.
+  if (S.pulled.size && k !== "u") S.autoPull = false;
   const r = curRow();
   let handled = true;
   if (k === "j" || k === "ArrowDown") moveCursor(1);
@@ -1239,10 +1469,8 @@ document.addEventListener("keydown", (e) => {
     filterEl.focus();
     filterEl.select();
   } else if (k === "r") void rescan().then(() => toast("Re-scanned your tabs."));
-  else if (k === "R") {
-    modelSorter?.forget();
-    void rescan().then(() => toast("Re-sorted all tabs."));
-  }
+  else if (k === "R") openResort();
+  else if (k === "u") void pull();
   else if (k === "y") {
     if (r?.type !== "item") toast("Put the cursor on a tab to copy its URL.");
     else
@@ -1273,6 +1501,7 @@ listEl.addEventListener("click", (e) => {
   const row = el.closest<HTMLElement>("[data-key]");
   if (!row || el.closest(".rename")) return;
   setCursor(row.dataset.key!);
+  if (S.pulled.size) S.autoPull = false;
   const r = curRow();
   const apply = el.closest<HTMLElement>("[data-apply]");
   if (apply) {
