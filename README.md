@@ -37,7 +37,7 @@ Pinned tabs never appear on the dashboard and are never moved.
 
 ## Sorting
 
-An AI model groups tabs by subject. For each ungrouped tab, it writes a short subject and then picks one of your groups or a topic, seeing the tab's title (with the site name removed), your existing groups and the groups you proposed. Topics that are just a website name are rejected, and a topic with only one tab goes to the Leftovers window. While it works, the dashboard shows a progress bar and what goes in and out of the model.
+An AI model groups tabs by subject. For each ungrouped tab, it writes a short subject and then picks one of your groups or a topic, seeing the tab's title (with the site name removed), your existing groups and the groups you proposed. Tabs go to the model in the order they sit in your windows, and it is told that neighbouring tabs are more likely related; a tab right next to an existing group is marked as such, and a leftover tab between two tabs of the same group joins them. Topics that are just a website name are rejected, and a topic with only one tab goes to the Leftovers window. While it works, the dashboard shows a progress bar and what goes in and out of the model.
 
 Choose the model in **AI settings** (top right, or press `s`):
 

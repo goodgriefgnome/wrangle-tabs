@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildPrompt,
   cleanTitle,
+  fillBetweenNeighbours,
   ModelSorter,
   parseAnswer,
   resolveAnswer,
@@ -134,6 +135,49 @@ describe("buildPrompt", () => {
     expect(p).toContain("1. useEffect (on react.dev)");
     expect(p).toContain("2. Why does useEffect run twice?\n");
     expect(p).not.toMatch(/booking\.com|stackoverflow/i);
+  });
+});
+
+describe("neighbours", () => {
+  it("marks windows and tabs that sit next to an existing group", () => {
+    const g = group({ id: 7, title: "Trip", windowId: 2 });
+    const p = buildPrompt(
+      { tabs: [], existingGroups: [{ group: g, tabs: [tab({ url: "https://a.com/x", windowId: 2, index: 4, groupId: 7 })] }], userGroups: [] },
+      [],
+      [
+        tab({ url: "https://b.com/1", title: "Rye sourdough starter tips", windowId: 1, index: 0 }),
+        tab({ url: "https://c.com/2", title: "Hotel near Kyoto station", windowId: 2, index: 5 }),
+      ],
+    );
+    expect(p).toMatch(/\(window 1\)\n1\. Rye sourdough starter tips\n\(window 2\)\n2\. Hotel near Kyoto station \[next to E1\]/);
+  });
+
+  it("asks about tabs in browser order", async () => {
+    const { model, prompts } = fakeModel({ subject: (l) => l, topic: () => "none" });
+    const tabs = [
+      tab({ url: "https://x.com/c", title: "Third tab here", windowId: 2, index: 0 }),
+      tab({ url: "https://x.com/a", title: "First tab here", windowId: 1, index: 0 }),
+      tab({ url: "https://x.com/b", title: "Second tab here", windowId: 1, index: 1 }),
+    ];
+    await new ModelSorter(model).sort({ tabs, existingGroups: [], userGroups: [] });
+    expect(prompts[0]).toMatch(/1\. First.*\n2\. Second.*\n\(window 2\)\n3\. Third/);
+  });
+
+  it("puts a leftover between two tabs of the same group into that group", () => {
+    const tabs = [0, 1, 2, 3].map((index) => tab({ url: `https://x.com/${index}`, windowId: 1, index }));
+    const other = tab({ url: "https://x.com/o", windowId: 2, index: 0 });
+    const r = new Map([
+      [tabs[0].id, { kind: "new", name: "Baking" }],
+      [tabs[1].id, { kind: "left" }],
+      [tabs[2].id, { kind: "new", name: "baking" }],
+      [tabs[3].id, { kind: "left" }],
+      [other.id, { kind: "left" }],
+    ] as const as [number, import("../src/core/sorter").SortTarget][]);
+    const m = new Map(r);
+    fillBetweenNeighbours([...tabs, other], m);
+    expect(m.get(tabs[1].id)).toEqual({ kind: "new", name: "Baking" });
+    expect(m.get(tabs[3].id)).toEqual({ kind: "left" });
+    expect(m.get(other.id)).toEqual({ kind: "left" });
   });
 });
 

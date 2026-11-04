@@ -10,6 +10,7 @@ You get a numbered list of groups and a numbered list of tabs. For every tab, fi
 - Otherwise a new topic name of one to three words, broad enough to also cover related tabs, such as "Web development", "Japan trip", "Baking" or "Home office". Give tabs on related subjects the same topic, even when they are on different websites.
 - "none" when the tab is unrelated to every group and every other tab.
 Never use the name of a website or app (such as YouTube, GitHub, Wikipedia, Reddit or Google Docs) as a subject or a topic: say what the page itself is about.
+Tabs are listed in the order they sit in the browser, window by window. Tabs next to each other were often opened together, so they are more likely to share a subject. When a tab could fit more than one group, or its title says little, prefer the group of its neighbours, or the group it is marked as next to.
 Answer with JSON only.`;
 
 const SCHEMA = {
@@ -85,6 +86,9 @@ function isSiteName(name: string, siteLabels: Set<string>): boolean {
 
 const tabKey = (t: TabInfo) => `${t.title}|${t.url}`;
 
+/** Where tabs sit: window, then position in the window. */
+export const byPosition = (a: TabInfo, b: TabInfo) => a.windowId - b.windowId || a.index - b.index;
+
 export function buildPrompt(input: SortInput, topics: string[], batch: TabInfo[]): string {
   const lines: string[] = ["Groups:"];
   input.userGroups.forEach((g, i) => {
@@ -100,11 +104,21 @@ export function buildPrompt(input: SortInput, topics: string[], batch: TabInfo[]
   topics.forEach((name, i) => lines.push(`N${i + 1}: ${quote(name)} (new topic, already used for other tabs)`));
   if (lines.length === 1) lines.push("None yet.");
   lines.push("", "Tabs:");
+  // Existing-group tabs by position, to tell the model which group a tab sits next to.
+  const groupAt = new Map<string, string>();
+  input.existingGroups.forEach(({ tabs }, i) => tabs.forEach((t) => groupAt.set(`${t.windowId}:${t.index}`, `E${i + 1}`)));
+  const windows = [...new Set(batch.map((t) => t.windowId))];
   batch.forEach((t, i) => {
+    if (windows.length > 1 && (i === 0 || batch[i - 1].windowId !== t.windowId)) {
+      lines.push(`(window ${windows.indexOf(t.windowId) + 1})`);
+    }
     const title = cleanTitle(t.title, t.url);
     // The website only helps with very short titles ("useEffect"); otherwise it tempts the model to group by site.
     const short = title.split(/\s+/).length < 4;
-    lines.push(`${i + 1}. ${clip(title, 100)}${short && hostOf(t.url) ? ` (on ${hostOf(t.url)})` : ""}`);
+    const near = [...new Set([t.index - 1, t.index + 1].map((n) => groupAt.get(`${t.windowId}:${n}`)).filter(Boolean))];
+    lines.push(
+      `${i + 1}. ${clip(title, 100)}${short && hostOf(t.url) ? ` (on ${hostOf(t.url)})` : ""}${near.length ? ` [next to ${near.join(" and ")}]` : ""}`,
+    );
   });
   lines.push(
     "",
@@ -167,22 +181,17 @@ export function resolveAnswer(answer: string, input: SortInput, topics: string[]
 }
 
 /**
- * Sorts tabs with Chrome's built-in model (Gemini Nano), in two steps (see above).
- * - Both steps go to the model in batches that fit its context window.
- * - Subjects are remembered per tab; topics per subject until the groups change.
- *   So re-scans only ask about new tabs.
- * - A topic with a single tab goes to Leftovers.
- * - Tabs the model fails on are sorted by website.
-
-/**
  * Sorts tabs with a language model (see ./model.ts for the models it can use).
  * For each tab the model writes a subject and then picks a group, in one answer.
  * - Tabs go to the model in batches that fit its context window. Topic names
  *   from earlier batches are offered to later ones, so topics stay consistent.
  * - Answers are remembered per tab until forget() is called, so re-scans only ask about new tabs
  *   and suggestions stay put while the user reviews them.
+ * - Tabs go to the model in the order they sit in the browser, and the prompt says so,
+ *   because neighbouring tabs are more likely to be related.
  * - Website names are rejected as topics; a topic with a single tab goes to Leftovers.
  * - Tabs the model fails on are sorted by website.
+ * - A tab left over between two neighbours that go to the same group joins them.
  */
 export class ModelSorter implements Sorter {
   readonly label: string;
@@ -227,7 +236,7 @@ export class ModelSorter implements Sorter {
     const result = new Map<number, SortTarget>();
     this.lastSubjects = new Map();
     const todo: TabInfo[] = [];
-    for (const t of input.tabs) {
+    for (const t of [...input.tabs].sort(byPosition)) {
       const hit = this.cache.get(tabKey(t));
       if (hit) {
         result.set(t.id, hit.target);
@@ -323,8 +332,34 @@ export class ModelSorter implements Sorter {
     const counts = new Map<string, number>();
     for (const v of result.values()) if (v.kind === "new") counts.set(normName(v.name), (counts.get(normName(v.name)) ?? 0) + 1);
     for (const [id, v] of result) if (v.kind === "new" && counts.get(normName(v.name))! < 2) result.set(id, { kind: "left" });
+    fillBetweenNeighbours(input.tabs, result);
     return result;
   }
+}
+
+const sameTarget = (a: SortTarget, b: SortTarget) =>
+  a.kind === b.kind &&
+  (a.kind === "existing" ? a.groupId === (b as typeof a).groupId
+    : a.kind === "user" ? a.id === (b as typeof a).id
+    : a.kind === "new" ? normName(a.name) === normName((b as typeof a).name)
+    : true);
+
+/**
+ * A leftover tab whose nearest neighbours on both sides (in the same window, among the tabs
+ * being sorted) go to the same group joins that group: tabs that sit together tend to belong together.
+ */
+export function fillBetweenNeighbours(tabs: TabInfo[], result: Map<number, SortTarget>): void {
+  const sorted = [...tabs].sort(byPosition);
+  const before = new Map(result);
+  sorted.forEach((t, i) => {
+    if (before.get(t.id)?.kind !== "left") return;
+    const prev = sorted[i - 1];
+    const next = sorted[i + 1];
+    if (!prev || !next || prev.windowId !== t.windowId || next.windowId !== t.windowId) return;
+    const a = before.get(prev.id);
+    const b = before.get(next.id);
+    if (a && b && a.kind !== "left" && sameTarget(a, b)) result.set(t.id, a);
+  });
 }
 
 /**
