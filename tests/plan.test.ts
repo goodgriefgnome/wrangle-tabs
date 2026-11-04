@@ -30,7 +30,7 @@ describe("buildPlan", () => {
     const grouped = tab({ url: "https://x.com/1", groupId: 3 });
     const dupe = tab({ url: "https://mail.google.com/" });
     const p = await plan({ tabs: [pinned, grouped, dupe], groups: [group({ id: 3 })], leftoversWindowId: null });
-    expect(p.duplicates).toEqual([{ closeId: dupe.id, keepId: pinned.id }]);
+    expect(p.close).toEqual([{ tabId: dupe.id, keepId: pinned.id }]);
     expect(p.leftovers).toEqual([]);
     expect(p.newGroups).toEqual([]);
     expect(p.addToExisting).toEqual([]);
@@ -78,5 +78,31 @@ describe("buildPlan", () => {
     const g = tab({ url: "https://z.com/", groupId: 1 });
     const p = await plan({ tabs: [a, b, g], groups: [group({ id: 1, color: "blue" })], leftoversWindowId: null });
     expect(p.newGroups[0].color).not.toBe("blue");
+  });
+
+  it("puts tabs marked for closing in the Close group, and keeps duplicates the user moved", async () => {
+    const a = tab({ url: "https://react.dev/a" });
+    const b = tab({ url: "https://react.dev/a" });
+    const c = tab({ url: "https://react.dev/c" });
+    const marked = tab({ url: "https://weather.gov/" });
+    const keep = b.lastAccessed >= a.lastAccessed ? a : b;
+    const dupe = keep === a ? b : a;
+    const manual = new Map<number, ManualTarget>([[marked.id, { kind: "close" }]]);
+    let p = await plan({ tabs: [a, b, c, marked], groups: [], leftoversWindowId: null }, [], manual);
+    expect(p.close).toEqual([{ tabId: dupe.id, keepId: keep.id }, { tabId: marked.id }]);
+    expect(p.leftovers).not.toContain(marked.id);
+
+    manual.set(dupe.id, { kind: "left" });
+    p = await plan({ tabs: [a, b, c, marked], groups: [], leftoversWindowId: null }, [], manual);
+    expect(p.close).toEqual([{ tabId: marked.id }]);
+    expect(p.leftovers).toContain(dupe.id);
+  });
+
+  it("adds tabs to an existing group when a suggested topic has since become that group", async () => {
+    const a = tab({ url: "https://react.dev/a" });
+    const b = tab({ url: "https://react.dev/b" });
+    const p = await plan({ tabs: [a, b], groups: [group({ id: 4, title: "React.dev" })], leftoversWindowId: null });
+    expect(p.addToExisting).toEqual([{ groupId: 4, tabIds: [a.id, b.id] }]);
+    expect(p.newGroups).toEqual([]);
   });
 });

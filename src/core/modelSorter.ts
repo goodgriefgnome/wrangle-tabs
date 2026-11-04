@@ -85,13 +85,6 @@ function isSiteName(name: string, siteLabels: Set<string>): boolean {
 
 const tabKey = (t: TabInfo) => `${t.title}|${t.url}`;
 
-function groupSignature(input: SortInput): string {
-  return JSON.stringify([
-    input.existingGroups.map(({ group }) => [group.id, group.title]),
-    input.userGroups.map((g) => [g.id, g.name, g.hint]),
-  ]);
-}
-
 export function buildPrompt(input: SortInput, topics: string[], batch: TabInfo[]): string {
   const lines: string[] = ["Groups:"];
   input.userGroups.forEach((g, i) => {
@@ -99,7 +92,7 @@ export function buildPrompt(input: SortInput, topics: string[], batch: TabInfo[]
   });
   input.existingGroups.forEach(({ group, tabs }, i) => {
     const examples = tabs
-      .slice(0, 3)
+      .slice(0, 8)
       .map((t) => quote(clip(cleanTitle(t.title, t.url), 60)))
       .join("; ");
     lines.push(`E${i + 1}: ${quote(group.title || "Unnamed group")} (existing group)${examples ? `. It holds: ${examples}` : ""}`);
@@ -172,7 +165,8 @@ export function resolveAnswer(answer: string, input: SortInput, topics: string[]
  * For each tab the model writes a subject and then picks a group, in one answer.
  * - Tabs go to the model in batches that fit its context window. Topic names
  *   from earlier batches are offered to later ones, so topics stay consistent.
- * - Answers are remembered per tab until the groups change, so re-scans only ask about new tabs.
+ * - Answers are remembered per tab until forget() is called, so re-scans only ask about new tabs
+ *   and suggestions stay put while the user reviews them.
  * - Website names are rejected as topics; a topic with a single tab goes to Leftovers.
  * - Tabs the model fails on are sorted by website.
  */
@@ -183,7 +177,6 @@ export class ModelSorter implements Sorter {
   /** The last error from the model in the last sort, if any. */
   lastError: string | null = null;
   private cache = new Map<string, { subject: string; target: SortTarget }>();
-  private cacheSignature = "";
   private lastSubjects = new Map<number, string>();
 
   constructor(
@@ -191,6 +184,14 @@ export class ModelSorter implements Sorter {
     private readonly fallback: Sorter = new SiteSorter(),
   ) {
     this.label = `Sorted by ${model.name}`;
+  }
+
+  /**
+   * Forgets every remembered answer, so the next sort asks about all tabs again.
+   * Answers are otherwise kept, so suggestions don't shift while the user reviews them.
+   */
+  forget(): void {
+    this.cache.clear();
   }
 
   /** What the model said the tab is about, from the last sort. */
@@ -201,11 +202,6 @@ export class ModelSorter implements Sorter {
   async sort(input: SortInput, options: SortOptions = {}): Promise<Map<number, SortTarget>> {
     const { signal, onProgress, onModel } = options;
     this.lastError = null;
-    const signature = groupSignature(input);
-    if (signature !== this.cacheSignature) {
-      this.cache.clear();
-      this.cacheSignature = signature;
-    }
     const siteLabels = new Set(
       [...input.tabs, ...input.existingGroups.flatMap((g) => g.tabs)].map((t) => siteLabel(t.url)).filter((l): l is string => !!l),
     );

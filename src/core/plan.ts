@@ -2,7 +2,6 @@ import { findDuplicates } from "./duplicates";
 import type { Sorter, SortOptions } from "./sorter";
 import {
   GROUP_COLORS,
-  type DuplicateSuggestion,
   type GroupColor,
   type Snapshot,
   type TabInfo,
@@ -16,7 +15,14 @@ import {
 export type ManualTarget =
   | { kind: "existing"; groupId: number }
   | { kind: "new"; key: string }
-  | { kind: "left" };
+  | { kind: "left" }
+  | { kind: "close" };
+
+/** A tab in the Close group: a duplicate (with the copy that stays open) or one the user marked. */
+export interface CloseItem {
+  tabId: number;
+  keepId?: number;
+}
 
 export interface NewGroupPlan {
   /** "user:<id>" or "ai:<name>". */
@@ -30,7 +36,8 @@ export interface NewGroupPlan {
 }
 
 export interface Plan {
-  duplicates: DuplicateSuggestion[];
+  close: CloseItem[];
+  /** Duplicates that are left alone, explained. */
   notes: string[];
   addToExisting: { groupId: number; tabIds: number[] }[];
   newGroups: NewGroupPlan[];
@@ -51,8 +58,19 @@ const byPosition = (a: TabInfo, b: TabInfo) => a.windowId - b.windowId || a.inde
 
 export async function buildPlan({ snapshot, userGroups, manual, aiOverrides, sorter, sortOptions }: PlanInput): Promise<Plan> {
   const { tabs, groups, leftoversWindowId } = snapshot;
-  const { duplicates, notes } = findDuplicates(tabs, groups);
-  const closing = new Set(duplicates.map((d) => d.closeId));
+  const found = findDuplicates(tabs, groups);
+  const notes = found.notes;
+  // A duplicate the user moved somewhere else is kept open.
+  const close: CloseItem[] = found.duplicates
+    .filter((d) => !manual.has(d.closeId) || manual.get(d.closeId)!.kind === "close")
+    .map((d) => ({ tabId: d.closeId, keepId: d.keepId }));
+  const closing = new Set(close.map((c) => c.tabId));
+  for (const t of tabs) {
+    if (!t.pinned && manual.get(t.id)?.kind === "close" && !closing.has(t.id)) {
+      close.push({ tabId: t.id });
+      closing.add(t.id);
+    }
+  }
 
   const groupIds = new Set(groups.map((g) => g.id));
   const userIds = new Set(userGroups.map((g) => g.id));
@@ -64,6 +82,7 @@ export async function buildPlan({ snapshot, userGroups, manual, aiOverrides, sor
   for (const t of candidates) {
     const m = manual.get(t.id);
     if (!m) continue;
+    if (m.kind === "close") continue;
     if (m.kind === "existing" && !groupIds.has(m.groupId)) continue;
     if (m.kind === "new" && m.key.startsWith("user:") && !userIds.has(m.key.slice(5))) continue;
     handPlaced.set(t.id, m);
@@ -88,11 +107,16 @@ export async function buildPlan({ snapshot, userGroups, manual, aiOverrides, sor
     else if (tab.windowId !== leftoversWindowId) leftovers.push(tab.id);
   };
 
+  const loose = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+  const existingByName = new Map(groups.filter((g) => g.title).map((g) => [loose(g.title), g.id]));
   for (const tab of toSort) {
     const s = sorted.get(tab.id) ?? { kind: "left" as const };
     if (s.kind === "existing" && groupIds.has(s.groupId)) place(tab, s);
     else if (s.kind === "user" && userIds.has(s.id)) place(tab, { kind: "new", key: `user:${s.id}` });
-    else if (s.kind === "new") {
+    else if (s.kind === "new" && existingByName.has(loose(s.name))) {
+      // A suggested topic that has since become a real group: add to that group.
+      place(tab, { kind: "existing", groupId: existingByName.get(loose(s.name))! });
+    } else if (s.kind === "new") {
       const key = `ai:${s.name}`;
       aiNames.set(key, s.name);
       place(tab, { kind: "new", key });
@@ -142,7 +166,7 @@ export async function buildPlan({ snapshot, userGroups, manual, aiOverrides, sor
   }
 
   return {
-    duplicates,
+    close,
     notes,
     addToExisting: groups
       .filter((g) => existing.has(g.id))

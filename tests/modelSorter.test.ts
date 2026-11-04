@@ -155,7 +155,7 @@ const script: Script = {
     : "none",
 };
 
-describe("NanoSorter", () => {
+describe("ModelSorter", () => {
   const tabs = () => [
     tab({ url: "https://react.dev/a", title: "useEffect – React" }),
     tab({ url: "https://vite.dev/config", title: "Configuring Vite" }),
@@ -206,7 +206,7 @@ describe("NanoSorter", () => {
     expect(progress).toContain(12);
   });
 
-  it("only asks about new tabs until the groups change", async () => {
+  it("only asks about new tabs until told to forget", async () => {
     const t = tabs();
     const model = fakeModel(script);
     const sorter = new ModelSorter(model.model);
@@ -218,6 +218,11 @@ describe("NanoSorter", () => {
     expect(model.prompts[1]).toContain('N2: "Baking"');
     await sorter.sort(input(t.slice(0, 4)));
     expect(model.prompts).toHaveLength(2);
+    // Changing the groups doesn't reshuffle what was already sorted…
+    await sorter.sort(input(t.slice(0, 4), { userGroups: [{ id: "u", name: "New", hint: "", color: "red" }] }));
+    expect(model.prompts).toHaveLength(2);
+    // …until the dashboard asks for a fresh sort.
+    sorter.forget();
     await sorter.sort(input(t.slice(0, 4), { userGroups: [{ id: "u", name: "New", hint: "", color: "red" }] }));
     expect(model.prompts).toHaveLength(3);
     expect(model.prompts[2]).toContain("useEffect");

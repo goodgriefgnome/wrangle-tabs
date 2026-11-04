@@ -164,3 +164,10 @@ button.link:focus-visible { outline: 2px solid var(--cursor-edge); outline-offse
 [hidden] { display: none !important; }
 .dialog .choice input { width: auto; flex: none; padding: 0; border: 0; margin: 3px 0 0; }
 .dialog .choice input:focus { background: none; outline: 2px solid var(--cursor-edge); outline-offset: 2px; }
+
+.row.sel { background: color-mix(in srgb, var(--accent) 10%, var(--surface)); }
+.row.sel.cur { background: var(--cursor); }
+.applybtn { font-size: 12px; padding: 3px 10px; white-space: nowrap; }
+.applybtn kbd { font-size: 10px; }
+.chip.closechip { background: var(--danger); color: var(--surface); }
+.summary kbd { font-size: 10.5px; }

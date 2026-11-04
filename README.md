@@ -2,7 +2,7 @@
 
 A Chrome extension that closes duplicate tabs and sorts the rest into tab groups, from one keyboard-driven page.
 
-Click the toolbar button (or press **Alt+Shift+T**) to open the dashboard. It lists every suggested change, all ticked. Untick what you don't want and press **Shift+Enter** to apply the rest. Unticked suggestions stay on the page for later.
+Click the toolbar button (or press **Alt+Shift+T**) to open the dashboard. It shows your ungrouped tabs sorted into suggested groups. Review one group at a time: fix any tab that's in the wrong place (select tabs with `x`, move them with `m`, mark them for closing with `#`), then press **Shift+Enter** to apply that group. It's carried out in Chrome straight away and leaves the list. Groups you haven't reviewed stay as they are.
 
 ## Install
 
@@ -16,7 +16,9 @@ Builds of other branches are on the [Actions](https://github.com/goodgriefgnome/
 
 ## What it does
 
-**Closes duplicates.** Two tabs are duplicates when their URLs match after cleanup (case, `www.`, `http`/`https`, trailing `/`, and tracking parameters such as `utm_*` and `fbclid` are ignored). If the URLs differ only after the `#`, the titles must match too, so `…/docs#section` matches `…/docs`, but Gmail's `#inbox` and `#label/receipts` don't.
+**Closes tabs.** The Close group holds duplicates and any tab you mark with `#`. Applying it closes them; until then, moving a tab out of it keeps it open.
+
+Two tabs are duplicates when their URLs match after cleanup (case, `www.`, `http`/`https`, trailing `/`, and tracking parameters such as `utm_*` and `fbclid` are ignored). If the URLs differ only after the `#`, the titles must match too, so `…/docs#section` matches `…/docs`, but Gmail's `#inbox` and `#label/receipts` don't.
 
 - A pinned copy is always the one kept; pinned tabs are never closed.
 - Otherwise it keeps the active tab, then a tab playing audio, then the most recently used.
@@ -46,7 +48,7 @@ Choose the model in **AI settings** (top right, or press `s`):
 
 API keys are stored only in this browser and are never synced. The extension asks for permission to reach an online model's website when you choose it.
 
-If the AI fails on some tabs, they're sorted by website, and the status line at the bottom says why. Answers are remembered per tab, so re-scans only ask about tabs that are new, until your groups change.
+The model decides from each tab and the current state of the groups (their names, and the tabs already in them), not from your earlier corrections. If it fails on some tabs, they're sorted by website, and the status line at the bottom says why. Answers are remembered per tab, so suggestions don't shift while you review them: re-scans only sort new tabs. Proposing or deleting a group, or pressing `R`, sorts everything again.
 
 ## Keys
 
@@ -56,9 +58,10 @@ If the AI fails on some tabs, they're sorted by website, and the status line at 
 | `J` / `K` | Next / previous section |
 | `g` / `G` | First / last row |
 | `h` / `l` | Collapse / expand group |
-| `x`, space | Tick or untick row or group |
-| `a` | Tick or untick the whole section |
-| `m` | Move tab to another group |
+| Shift+Enter | Apply the group under the cursor |
+| `x`, space | Select a tab, or all of a group's tabs |
+| `m` | Move the selected tabs (or the tab under the cursor) to another group |
+| `#` | Mark the selected tabs (or the tab) for closing; again to unmark |
 | `n` | Propose your own group |
 | `d` | Delete a group you proposed |
 | `e` | Rename a new group |
@@ -66,9 +69,10 @@ If the AI fails on some tabs, they're sorted by website, and the status line at 
 | Enter | Switch to the tab |
 | `y` | Copy the tab's full URL |
 | `/` | Filter |
-| `r` | Re-scan tabs |
+| Esc | Clear the selection, then the filter |
+| `r` | Re-scan tabs; only new tabs get sorted |
+| `R` | Re-sort all tabs from scratch |
 | `s` | AI settings |
-| Shift+Enter | Apply ticked changes |
 | `?` | All shortcuts |
 
 ## Development

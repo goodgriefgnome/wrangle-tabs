@@ -24,8 +24,8 @@ const S = {
   /** Tabs the user moved by hand. Re-sorting leaves them where they were put. */
   manual: new Map<number, ManualTarget>(),
   aiOverrides: new Map<string, { name?: string; color?: GroupColor }>(),
-  /** Item keys the user unticked. Everything else starts ticked. */
-  unticked: new Set<string>(),
+  /** Tabs selected for a bulk move or close. */
+  selected: new Set<number>(),
   collapsed: new Set<string>(),
   cursor: null as string | null,
   lastIdx: 0,
@@ -122,15 +122,14 @@ function toast(msg: string) {
   (toast as { t?: number }).t = window.setTimeout(() => root.replaceChildren(), 3000);
 }
 
-const ticked = (key: string) => !S.unticked.has(key);
-
 /* ---------------------------------------------------------------- rows */
 
-type SectionKey = "dupe" | "existing" | "new" | "left";
+type SectionKey = "close" | "existing" | "new" | "left";
 
+/** A group of suggestions you review and apply as a whole. */
 interface Block {
   key: string;
-  section: "existing" | "new";
+  section: SectionKey;
   groupId?: number;
   newGroup?: NewGroupPlan;
   tabIds: number[];
@@ -140,23 +139,24 @@ type Row =
   | { type: "section"; section: SectionKey; count: number }
   | { type: "info"; text: string }
   | { type: "block"; key: string; block: Block }
-  | { type: "item"; key: string; section: SectionKey; block: Block | null; tabId: number };
+  | { type: "item"; key: string; section: SectionKey; block: Block; tabId: number };
 
 const SECTIONS: Record<SectionKey, { title: string; hint: string }> = {
-  dupe: { title: "Close duplicates", hint: "One copy stays open. Copies in two different groups are never touched." },
+  close: { title: "Close", hint: "Duplicates, and tabs you marked with #. Duplicates in two different groups are never touched." },
   existing: { title: "Add to your groups", hint: "Your existing groups never lose tabs or get mixed together." },
   new: {
     title: "New groups",
     hint: "Created in the window that already holds most of their tabs. Press n to propose your own.",
   },
-  left: { title: "Leftovers window", hint: "Tabs that don't fit a group." },
+  left: { title: "Leftovers", hint: "Tabs that don't fit a group go to one window." },
 };
-const SECTION_ORDER: SectionKey[] = ["dupe", "existing", "new", "left"];
+const SECTION_ORDER: SectionKey[] = ["close", "existing", "new", "left"];
 
-const itemKey = (prefix: string, tabId: number) => `${prefix}|${tabId}`;
+const itemKey = (blockKey: string, tabId: number) => `${blockKey}|${tabId}`;
 
 function blocksOf(plan: Plan): Block[] {
   return [
+    { key: "close", section: "close", tabIds: plan.close.map((c) => c.tabId) },
     ...plan.addToExisting.map((a) => ({
       key: `existing:${a.groupId}`,
       section: "existing" as const,
@@ -164,6 +164,7 @@ function blocksOf(plan: Plan): Block[] {
       tabIds: a.tabIds,
     })),
     ...plan.newGroups.map((g) => ({ key: `new:${g.key}`, section: "new" as const, newGroup: g, tabIds: g.tabIds })),
+    { key: "left", section: "left", tabIds: plan.leftovers },
   ];
 }
 
@@ -173,54 +174,62 @@ const navRows = () => rows.filter((r): r is Extract<Row, { key: string }> => "ke
 function buildRows(plan: Plan): Row[] {
   const out: Row[] = [];
   const blocks = blocksOf(plan);
-
-  const dupes = plan.duplicates.filter((d) => matches(d.closeId));
-  out.push({ type: "section", section: "dupe", count: plan.duplicates.length });
-  for (const d of dupes) {
-    out.push({ type: "item", key: itemKey("close", d.closeId), section: "dupe", block: null, tabId: d.closeId });
-  }
-  if (!S.filter) for (const text of plan.notes) out.push({ type: "info", text });
-  if (!dupes.length) out.push({ type: "info", text: S.filter ? "No matches." : "No duplicates." });
-
-  for (const section of ["existing", "new"] as const) {
+  for (const section of SECTION_ORDER) {
     const bs = blocks.filter(
-      (b) => b.section === section && (!S.filter ? true : b.tabIds.some(matches)),
+      (b) =>
+        b.section === section &&
+        (S.filter ? b.tabIds.some(matches) : b.tabIds.length > 0 || b.newGroup?.mine),
     );
     out.push({ type: "section", section, count: bs.reduce((n, b) => n + b.tabIds.length, 0) });
     for (const b of bs) {
       out.push({ type: "block", key: b.key, block: b });
       if (!S.collapsed.has(b.key)) {
-        for (const id of b.tabIds.filter(matches)) {
-          out.push({ type: "item", key: itemKey(b.key, id), section, block: b, tabId: id });
-        }
+        for (const id of b.tabIds.filter(matches)) out.push({ type: "item", key: itemKey(b.key, id), section, block: b, tabId: id });
       }
-      if (b.newGroup?.mine && !b.tabIds.length) {
-        out.push({ type: "info", text: "No matching tabs yet. Move tabs here with m." });
-      }
+      if (b.newGroup?.mine && !b.tabIds.length) out.push({ type: "info", text: "No matching tabs yet. Move tabs here with m." });
     }
+    if (section === "close" && !S.filter) for (const text of plan.notes) out.push({ type: "info", text });
     if (!bs.length) out.push({ type: "info", text: S.filter ? "No matches." : "Nothing to do here." });
   }
-
-  const left = plan.leftovers.filter(matches);
-  out.push({ type: "section", section: "left", count: plan.leftovers.length });
-  for (const id of left) out.push({ type: "item", key: itemKey("left", id), section: "left", block: null, tabId: id });
-  if (!left.length) out.push({ type: "info", text: S.filter ? "No matches." : "Nothing to do here." });
-
   return out;
 }
 
-function blockState(b: Block): "" | "on" | "part" {
-  const on = b.tabIds.filter((id) => ticked(itemKey(b.key, id))).length;
-  return on === 0 ? "" : on === b.tabIds.length ? "on" : "part";
+/** Whether a block's tabs are all, some or none selected. */
+function blockSelection(b: Block): "" | "on" | "part" {
+  const n = b.tabIds.filter((id) => S.selected.has(id)).length;
+  return n === 0 ? "" : n === b.tabIds.length ? "on" : "part";
 }
 
 function blockWindow(b: Block): number | null {
+  if (b.section === "left") return S.leftoversWindowId;
   if (b.groupId !== undefined) return groups.get(b.groupId)?.windowId ?? null;
   return majorityWindow(b.tabIds);
 }
 
+function blockName(b: Block): string {
+  if (b.section === "close") return "Close";
+  if (b.section === "left") return "Leftovers window";
+  if (b.groupId !== undefined) return groups.get(b.groupId)?.title || "Unnamed group";
+  return b.newGroup!.name;
+}
+
+/** What applying a block does, as a button label. */
+function applyLabel(b: Block): string {
+  const n = b.tabIds.length;
+  const tabsWord = `${n} ${n === 1 ? "tab" : "tabs"}`;
+  if (b.section === "close") return `Close ${tabsWord}`;
+  if (b.section === "left") return `Move ${tabsWord} to Leftovers`;
+  if (b.section === "existing") return `Add ${tabsWord} to “${blockName(b)}”`;
+  return `Create “${blockName(b)}”`;
+}
+
 function rowId(key: string) {
   return "r-" + key.replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+/** The block under the cursor: the group header, or the group of the tab under it. */
+function curBlock(): Block | undefined {
+  return curRow()?.block;
 }
 
 function rowHTML(r: Row): string {
@@ -233,13 +242,18 @@ function rowHTML(r: Row): string {
 
   if (r.type === "block") {
     const b = r.block;
-    const st = blockState(b);
+    const st = blockSelection(b);
     const caret = `<span class="caret" aria-hidden="true">${S.collapsed.has(b.key) ? "▸" : "▾"}</span>`;
     let name: string;
     let hint = "";
-    let meta: string;
+    let meta = "";
     const win = blockWindow(b);
-    if (b.groupId !== undefined) {
+    if (b.section === "close") {
+      name = `<span class="chip closechip">Close</span>`;
+    } else if (b.section === "left") {
+      name = `<span class="chip ghost">Leftovers window</span>`;
+      meta = `<span class="win">${win !== null ? winShort(win) : "new window"}</span>`;
+    } else if (b.groupId !== undefined) {
       const g = groups.get(b.groupId);
       name = `<span class="chip outline" style="--c: var(--tg-${g?.color ?? "grey"})">${esc(g?.title || "Unnamed group")}</span>`;
       meta = `<span class="win">existing${win !== null ? " · " + winShort(win) : ""}</span>`;
@@ -250,26 +264,28 @@ function rowHTML(r: Row): string {
           ? `<input class="rename" id="rename-input" value="${esc(g.name)}" aria-label="Group name">`
           : `<span class="chip" style="--c: var(--tg-${g.color})">${esc(g.name)}</span>`;
       hint = g.hint;
-      meta =
-        (g.mine ? `<span class="chip ghost">yours</span>` : "") +
-        `<span class="win">new${win !== null ? " · " + winShort(win) : ""}</span>`;
+      meta = (g.mine ? `<span class="chip ghost">yours</span>` : "") + `<span class="win">new${win !== null ? " · " + winShort(win) : ""}</span>`;
     }
-    return `<div class="row block on-row${cur}" id="${rowId(r.key)}" data-key="${esc(r.key)}" role="option" aria-selected="${st === "on"}">${caret}<span class="cb ${st}" data-cb></span>${name}<span class="title hintx">${esc(hint)}</span>${meta}</div>`;
+    const isCurBlock = curBlock()?.key === b.key;
+    const apply = b.tabIds.length
+      ? `<button type="button" class="applybtn${isCurBlock ? " primary" : ""}" data-apply="${esc(b.key)}">${esc(applyLabel(b))}${isCurBlock ? "<kbd>⇧↵</kbd>" : ""}</button>`
+      : "";
+    return `<div class="row block on-row${cur}" id="${rowId(r.key)}" data-key="${esc(r.key)}" role="option" aria-selected="${st === "on"}">${caret}<span class="cb ${st}" data-cb></span>${name}<span class="title hintx">${esc(hint)}</span>${meta}${apply}</div>`;
   }
 
   const t = tabs.get(r.tabId);
   if (!t) return "";
-  const on = ticked(r.key);
+  const on = S.selected.has(r.tabId);
   let tail: string;
-  if (r.section === "dupe") {
-    const keepId = S.plan!.duplicates.find((d) => d.closeId === r.tabId)?.keepId;
+  if (r.section === "close") {
+    const keepId = S.plan!.close.find((c) => c.tabId === r.tabId)?.keepId;
     const k = keepId !== undefined ? tabs.get(keepId) : undefined;
-    const where = k
-      ? `keeps ${winShort(k.windowId)}${k.pinned ? " pinned" : ""}${k.groupId !== -1 ? " " + esc(groups.get(k.groupId)?.title || "group") : ""}`
-      : "";
-    tail = `<span class="closetag">close</span><span class="win">${winShort(t.windowId)}${where ? " · " + where : ""}</span>`;
+    const why = k
+      ? `duplicate · keeps ${winShort(k.windowId)}${k.pinned ? " pinned" : ""}${k.groupId !== -1 ? " " + esc(groups.get(k.groupId)?.title || "group") : ""}`
+      : "marked by you";
+    tail = `<span class="win">${winShort(t.windowId)} · ${why}</span>`;
   } else {
-    const target = r.section === "left" ? S.leftoversWindowId : r.block ? blockWindow(r.block) : null;
+    const target = blockWindow(r.block);
     tail =
       r.section === "left" && target === null
         ? `<span class="win">${winShort(t.windowId)} <span class="mv">→ new window</span></span>`
@@ -277,9 +293,8 @@ function rowHTML(r: Row): string {
           ? `<span class="win">${winShort(t.windowId)} <span class="mv">→ ${winShort(target)}</span></span>`
           : `<span class="win">${winShort(t.windowId)}</span>`;
   }
-  const flat = r.block ? "" : " flat";
   return (
-    `<div class="row item${flat}${on ? " on-row" : ""}${cur}" id="${rowId(r.key)}" data-key="${esc(r.key)}" role="option" aria-selected="${on}">` +
+    `<div class="row item on-row${on ? " sel" : ""}${cur}" id="${rowId(r.key)}" data-key="${esc(r.key)}" role="option" aria-selected="${on}">` +
     `<span class="cb ${on ? "on" : ""}" data-cb></span><img class="fav" src="${esc(favicon(t.url))}" alt="">` +
     `<span class="title">${esc(t.title)}</span><span class="host">${esc(host(t.url))}</span>${tail}</div>`
   );
@@ -318,10 +333,12 @@ function renderStats() {
   const all = [...tabs.values()].filter((t) => !t.pinned);
   const windows = new Set(all.map((t) => t.windowId));
   const ungrouped = all.filter((t) => t.groupId === -1 && t.windowId !== S.leftoversWindowId).length;
-  const dupes = S.plan?.duplicates.length ?? 0;
+  const toClose = S.plan?.close.length ?? 0;
+  const toReview = S.plan ? blocksOf(S.plan).filter((b) => b.tabIds.length).length : 0;
   $("#stats").innerHTML =
     `<span><b>${all.length}</b> tabs</span><span><b>${windows.size}</b> windows</span>` +
-    `<span class="warn"><b>${ungrouped}</b> ungrouped</span><span><b>${dupes}</b> duplicates</span>`;
+    `<span class="warn"><b>${ungrouped}</b> ungrouped</span><span><b>${toClose}</b> to close</span>` +
+    `<span><b>${toReview}</b> ${toReview === 1 ? "group" : "groups"} to review</span>`;
 }
 
 function renderWindows() {
@@ -346,35 +363,27 @@ function renderWindows() {
       .join("") || `<div class="row info">No tabs.</div>`;
 }
 
-function collectActions(): Actions {
-  const p = S.plan!;
-  return {
-    close: p.duplicates.map((d) => d.closeId).filter((id) => ticked(itemKey("close", id))),
-    addToExisting: p.addToExisting
-      .map((a) => ({ groupId: a.groupId, tabIds: a.tabIds.filter((id) => ticked(itemKey(`existing:${a.groupId}`, id))) }))
-      .filter((a) => a.tabIds.length),
-    newGroups: p.newGroups
-      .map((g) => ({ key: g.key, name: g.name, color: g.color, tabIds: g.tabIds.filter((id) => ticked(itemKey(`new:${g.key}`, id))) }))
-      .filter((g) => g.tabIds.length),
-    leftovers: p.leftovers.filter((id) => ticked(itemKey("left", id))),
-  };
-}
-
-function summaryParts(a: Actions): string[] {
-  const parts: string[] = [];
-  const add = a.addToExisting.reduce((n, x) => n + x.tabIds.length, 0);
-  const fresh = a.newGroups.reduce((n, x) => n + x.tabIds.length, 0);
-  if (a.close.length) parts.push(`close <b>${a.close.length}</b> duplicate${a.close.length > 1 ? "s" : ""}`);
-  if (add) parts.push(`add <b>${add}</b> to your groups`);
-  if (a.newGroups.length) parts.push(`create <b>${a.newGroups.length}</b> group${a.newGroups.length > 1 ? "s" : ""} (${fresh} tabs)`);
-  if (a.leftovers.length) parts.push(`move <b>${a.leftovers.length}</b> to Leftovers`);
-  return parts;
+/** The changes that applying one block makes. */
+function blockActions(b: Block): Actions {
+  const none: Actions = { close: [], addToExisting: [], newGroups: [], leftovers: [] };
+  if (b.section === "close") return { ...none, close: b.tabIds };
+  if (b.section === "left") return { ...none, leftovers: b.tabIds };
+  if (b.groupId !== undefined) return { ...none, addToExisting: [{ groupId: b.groupId, tabIds: b.tabIds }] };
+  const g = b.newGroup!;
+  return { ...none, newGroups: [{ name: g.name, color: g.color, tabIds: b.tabIds }] };
 }
 
 function renderSummary() {
-  const parts = summaryParts(collectActions());
-  $("#summary").innerHTML = parts.length ? "Ticked: " + parts.join(" · ") : "Nothing ticked.";
-  $<HTMLButtonElement>("#apply").disabled = !parts.length || S.busy || !!S.sorting;
+  const n = S.selected.size;
+  const b = curBlock();
+  $("#summary").innerHTML = n
+    ? `<b>${n}</b> ${n === 1 ? "tab" : "tabs"} selected · <kbd>m</kbd> move · <kbd>#</kbd> close · <kbd>esc</kbd> clear`
+    : b?.tabIds.length
+      ? `Looks right? <kbd>⇧↵</kbd> applies “${esc(blockName(b))}”.`
+      : "Move the cursor to a group to review it.";
+  const apply = $<HTMLButtonElement>("#apply");
+  apply.disabled = !b?.tabIds.length || S.busy;
+  apply.innerHTML = `${b?.tabIds.length ? esc(applyLabel(b)) : "Apply group"}<kbd>⇧↵</kbd>`;
 }
 
 function renderStatusLine() {
@@ -385,18 +394,16 @@ function renderStatusLine() {
     return;
   }
   if (r.type === "block") {
-    const name = r.block.groupId !== undefined ? groups.get(r.block.groupId)?.title || "Unnamed group" : r.block.newGroup!.name;
-    el.innerHTML = `<span class="url">Group: ${esc(name)}</span>`;
+    el.innerHTML = `<span class="url">Group: ${esc(blockName(r.block))}</span>`;
     return;
   }
   const t = tabs.get(r.tabId);
   let html = `<span class="url main">${esc(t?.url ?? "")}</span>`;
-  if (r.section !== "dupe") html += `<span class="url">${esc(sortExplanation(r.tabId))}</span>`;
-  if (r.section === "dupe") {
-    const keepId = S.plan!.duplicates.find((d) => d.closeId === r.tabId)?.keepId;
+  if (r.section === "close") {
+    const keepId = S.plan!.close.find((c) => c.tabId === r.tabId)?.keepId;
     const k = keepId !== undefined ? tabs.get(keepId) : undefined;
-    if (k) html += `<span class="url">keeps ${esc(k.url)}</span>`;
-  }
+    html += `<span class="url">${k ? `Duplicate. Keeps ${esc(k.url)}` : "Marked for closing by you. Move it with m to keep it."}</span>`;
+  } else html += `<span class="url">${esc(sortExplanation(r.tabId))}</span>`;
   el.innerHTML = html;
 }
 
@@ -739,7 +746,7 @@ function sectionOf(r: Extract<Row, { key: string }>): SectionKey {
 function jumpSection(d: number) {
   const nav = navRows();
   const cur = curRow();
-  const ci = SECTION_ORDER.indexOf(cur ? sectionOf(cur) : "dupe");
+  const ci = SECTION_ORDER.indexOf(cur ? sectionOf(cur) : "close");
   for (let s = ci + d; s >= 0 && s < SECTION_ORDER.length; s += d) {
     const first = nav.find((r) => sectionOf(r) === SECTION_ORDER[s]);
     if (first) {
@@ -750,38 +757,57 @@ function jumpSection(d: number) {
   }
 }
 
-function itemKeysOf(r: Extract<Row, { key: string }>): string[] {
-  return r.type === "block" ? r.block.tabIds.map((id) => itemKey(r.block.key, id)) : [r.key];
-}
-
-function setTicked(keys: string[], on: boolean) {
-  for (const k of keys) on ? S.unticked.delete(k) : S.unticked.add(k);
-}
-
-function toggle(r = curRow()) {
+/** Selects or unselects a tab, or all of a group's tabs. */
+function toggleSelect(r = curRow()) {
   if (!r) return;
-  const keys = itemKeysOf(r);
-  setTicked(keys, !keys.every(ticked));
+  const ids = r.type === "block" ? r.block.tabIds : [r.tabId];
+  const all = ids.every((id) => S.selected.has(id));
+  for (const id of ids) all ? S.selected.delete(id) : S.selected.add(id);
   render();
 }
 
-function toggleSection() {
+/** The tabs a bulk action applies to: the selection, or else the tab under the cursor. */
+function actionTabs(): number[] {
+  if (S.selected.size) return [...S.selected];
   const r = curRow();
-  if (!r) return;
-  const section = sectionOf(r);
-  const keys = rows
-    .filter((x): x is Extract<Row, { key: string }> => "key" in x && x.type === "item" && x.section === section)
-    .map((x) => x.key);
-  // Include items hidden inside collapsed groups.
-  for (const x of rows) if (x.type === "block" && x.block.section === section) keys.push(...itemKeysOf(x));
-  const unique = [...new Set(keys)];
-  setTicked(unique, !unique.every(ticked));
-  render();
+  return r?.type === "item" ? [r.tabId] : [];
+}
+
+/** Puts tabs where the user said, keeps them there through re-sorts, and clears the selection. */
+async function moveTabs(ids: number[], target: ManualTarget) {
+  // Keep the cursor where it was: on the next row that isn't moving, so you can carry on down the group.
+  const nav = navRows();
+  const at = nav.findIndex((r) => r.key === S.cursor);
+  const stays = (r: (typeof nav)[number]) => r.type === "block" || !ids.includes(r.tabId);
+  const next = nav.slice(at).find(stays) ?? nav.slice(0, at).reverse().find(stays);
+  for (const id of ids) S.manual.set(id, target);
+  S.selected.clear();
+  await replan();
+  if (next && navRows().some((r) => r.key === next.key)) {
+    setCursor(next.key);
+    render();
+  }
+}
+
+/** # : marks tabs for closing, or unmarks tabs already marked. */
+async function markClose() {
+  const ids = actionTabs();
+  if (!ids.length) return toast("Put the cursor on a tab, or select tabs with x, first.");
+  const marked = ids.filter((id) => S.manual.get(id)?.kind === "close");
+  if (marked.length === ids.length) {
+    for (const id of ids) S.manual.delete(id);
+    S.selected.clear();
+    await replan();
+    toast(`Unmarked ${ids.length} ${ids.length === 1 ? "tab" : "tabs"}.`);
+    return;
+  }
+  await moveTabs(ids, { kind: "close" });
+  toast(`${ids.length} ${ids.length === 1 ? "tab" : "tabs"} will close when you apply the Close group.`);
 }
 
 function collapse(r = curRow()) {
   if (!r) return;
-  if (r.type === "item" && r.block) setCursor(r.block.key);
+  if (r.type === "item") setCursor(r.block.key);
   else if (r.type === "block") S.collapsed.add(r.block.key);
   render();
 }
@@ -794,14 +820,13 @@ function expand(r = curRow()) {
 }
 
 function newGroupOf(r: Extract<Row, { key: string }> | undefined): NewGroupPlan | undefined {
-  if (!r) return undefined;
-  return r.type === "block" ? r.block.newGroup : r.block?.newGroup;
+  return r?.block.newGroup;
 }
 
 async function cycleColor() {
   const r = curRow();
   const g = newGroupOf(r);
-  if (!g) return toast(r && (r.type === "block" || r.block) ? "Existing groups keep their color." : "Put the cursor on a new group first.");
+  if (!g) return toast(r?.block.section === "existing" ? "Existing groups keep their color." : "Put the cursor on a new group first.");
   const color = GROUP_COLORS[(GROUP_COLORS.indexOf(g.color) + 1) % GROUP_COLORS.length];
   await updateNewGroup(g, { color });
 }
@@ -820,7 +845,7 @@ async function updateNewGroup(g: NewGroupPlan, change: { name?: string; color?: 
 function startRename() {
   const r = curRow();
   const g = newGroupOf(r);
-  if (!g) return toast(r && (r.type === "block" || r.block) ? "Rename existing groups in Chrome itself." : "Put the cursor on a new group first.");
+  if (!g) return toast(r?.block.section === "existing" ? "Rename existing groups in Chrome itself." : "Put the cursor on a new group first.");
   S.renaming = `new:${g.key}`;
   setCursor(S.renaming);
   render();
@@ -872,6 +897,7 @@ async function deleteUserGroup() {
   S.userGroups = S.userGroups.filter((u) => u.id !== id);
   for (const [tabId, m] of S.manual) if (m.kind === "new" && m.key === g.key) S.manual.delete(tabId);
   await saveUserGroups(S.userGroups);
+  modelSorter?.forget();
   await replan();
   toast(`Deleted “${g.name}”. Its tabs went back to the suggestions.`);
 }
@@ -954,17 +980,12 @@ function openPicker(title: string, opts: Option[]) {
 }
 
 function openMove() {
+  const ids = actionTabs();
+  if (!ids.length) return toast("Put the cursor on a tab, or select tabs with x, first.");
   const r = curRow();
-  if (!r || r.type !== "item") return toast("Put the cursor on a tab to move it.");
-  if (r.section === "dupe") return toast("Duplicates can only be closed or kept.");
-  const tabId = r.tabId;
-  const currentKey = r.block?.key ?? "left";
-  const moveTo = async (target: ManualTarget, cursorPrefix: string) => {
-    S.manual.set(tabId, target);
-    await replan();
-    setCursor(itemKey(cursorPrefix, tabId));
-    render();
-  };
+  // Leave out the group the tabs are already in, when they're all in the same one.
+  const currentKey = !S.selected.size && r?.type === "item" ? r.block.key : null;
+  const moveTo = (target: ManualTarget) => moveTabs(ids, target);
 
   const opts: Option[] = [];
   for (const g of groups.values()) {
@@ -974,43 +995,40 @@ function openMove() {
       label: g.title || "Unnamed group",
       color: g.color,
       meta: `existing · ${winShort(g.windowId)}`,
-      go: () => moveTo({ kind: "existing", groupId: g.id }, key),
+      go: () => moveTo({ kind: "existing", groupId: g.id }),
     });
   }
   for (const g of S.plan!.newGroups) {
     const key = `new:${g.key}`;
     if (key === currentKey) continue;
-    opts.push({
-      label: g.name,
-      color: g.color,
-      meta: g.mine ? "yours" : "new",
-      go: () => moveTo({ kind: "new", key: g.key }, key),
-    });
+    opts.push({ label: g.name, color: g.color, meta: g.mine ? "yours" : "new", go: () => moveTo({ kind: "new", key: g.key }) });
   }
-  if (currentKey !== "left") opts.push({ label: "Leftovers window", meta: "", go: () => moveTo({ kind: "left" }, "left") });
+  if (currentKey !== "left") opts.push({ label: "Leftovers window", meta: "", go: () => moveTo({ kind: "left" }) });
+  if (currentKey !== "close") opts.push({ label: "Close", meta: "#", go: () => moveTo({ kind: "close" }) });
   opts.push({
     label: "New group…",
     meta: "",
     go: async () => {
       const g = await addUserGroup("New group", "");
-      S.manual.set(tabId, { kind: "new", key: `user:${g.id}` });
-      await replan();
+      await moveTabs(ids, { kind: "new", key: `user:${g.id}` });
       S.renaming = `new:user:${g.id}`;
       setCursor(S.renaming);
       render();
     },
   });
-  if (S.manual.has(tabId)) {
+  if (ids.some((id) => S.manual.has(id))) {
     opts.push({
       label: "Let the sorter decide",
       meta: "undo your move",
       go: async () => {
-        S.manual.delete(tabId);
+        for (const id of ids) S.manual.delete(id);
+        S.selected.clear();
         await replan();
       },
     });
   }
-  openPicker(`Move “${esc(tabs.get(tabId)?.title ?? "")}”`, opts);
+  const what = ids.length === 1 ? `“${esc(tabs.get(ids[0])?.title ?? "")}”` : `${ids.length} tabs`;
+  openPicker(`Move ${what}`, opts);
 }
 
 function openPropose() {
@@ -1028,6 +1046,8 @@ function openPropose() {
     const hint = $<HTMLInputElement>("#pg-hint").value.trim();
     closeModal();
     const g = await addUserGroup(name, hint);
+    // Sort every tab again, so the new group can collect the tabs that fit it.
+    modelSorter?.forget();
     await replan();
     setCursor(`new:user:${g.id}`);
     render();
@@ -1045,50 +1065,29 @@ function openPropose() {
   $("#pg-name").focus();
 }
 
-function openApply() {
-  const actions = collectActions();
-  const parts = summaryParts(actions);
-  if (S.sorting) return toast("Still sorting. Try again in a moment.");
-  if (!parts.length) return toast("Tick something first.");
-  const total =
-    actions.close.length +
-    actions.leftovers.length +
-    actions.addToExisting.reduce((n, a) => n + a.tabIds.length, 0) +
-    actions.newGroups.reduce((n, a) => n + a.tabIds.length, 0);
-  showOverlay(`<div class="dialog" role="dialog" aria-modal="true" aria-label="Apply changes">
-    <header>Apply ${total} change${total > 1 ? "s" : ""}?<small>Unticked suggestions stay on this page for later.</small></header>
-    <div class="body"><ul>${parts.map((p) => `<li>${p.charAt(0).toUpperCase() + p.slice(1)}</li>`).join("")}</ul></div>
-    <footer><button type="button" id="ap-cancel">Cancel<kbd>esc</kbd></button><button type="button" class="primary" id="ap-go">Apply<kbd>↵</kbd></button></footer></div>`);
-  const go = () => {
-    closeModal();
-    void doApply(actions);
-  };
-  S.modal = (e) => {
-    if (e.key === "Escape") closeModal();
-    else if (e.key === "Enter") go();
-    else return;
-    e.preventDefault();
-  };
-  $("#ap-go").addEventListener("click", go);
-  $("#ap-cancel").addEventListener("click", closeModal);
-  $("#ap-go").focus();
-}
-
-async function doApply(actions: Actions) {
+/** Shift+Enter: carries out the group under the cursor, as reviewed. */
+async function applyGroup(b = curBlock()) {
+  if (!b || !b.tabIds.length) return toast("Put the cursor on a group with tabs to apply it.");
+  if (S.busy) return;
   S.busy = true;
+  const label = applyLabel(b);
   renderSummary();
   try {
-    const result = await applyActions(actions, S.leftoversWindowId);
+    const result = await applyActions(blockActions(b), S.leftoversWindowId);
     if (result.leftoversWindowId !== S.leftoversWindowId) {
       S.leftoversWindowId = result.leftoversWindowId;
       await saveLeftoversWindowId(S.leftoversWindowId);
     }
-    // Proposed groups that now exist in Chrome are done.
-    const created = new Set(actions.newGroups.map((g) => (g as { key?: string }).key));
-    S.userGroups = S.userGroups.filter((u) => !created.has(`user:${u.id}`));
-    await saveUserGroups(S.userGroups);
-    const parts = summaryParts(actions).map((p) => p.replace(/<\/?b>/g, ""));
-    toast(result.errors.length ? `Done, with problems: ${result.errors.join("; ")}` : "Done: " + parts.join(" · "));
+    // A proposed group that now exists in Chrome is done.
+    if (b.newGroup?.mine) {
+      S.userGroups = S.userGroups.filter((u) => `user:${u.id}` !== b.newGroup!.key);
+      await saveUserGroups(S.userGroups);
+    }
+    for (const id of b.tabIds) {
+      S.manual.delete(id);
+      S.selected.delete(id);
+    }
+    toast(result.errors.length ? `Done, with problems: ${result.errors.join("; ")}` : `Done: ${label}.`);
   } finally {
     S.busy = false;
     await rescan();
@@ -1105,9 +1104,9 @@ function openHelp() {
     [["G"], "Last row"],
     [["h", "←"], "Collapse group"],
     [["l", "→"], "Expand group"],
-    [["x", "space"], "Tick or untick row or group"],
-    [["a"], "Tick or untick whole section"],
-    [["m"], "Move tab to another group"],
+    [["x", "space"], "Select tab, or all of a group's tabs"],
+    [["m"], "Move selected tabs (or the tab) to another group"],
+    [["#"], "Mark selected tabs (or the tab) for closing"],
     [["n"], "Propose your own group"],
     [["d"], "Delete a group you proposed"],
     [["e"], "Rename new group"],
@@ -1115,10 +1114,11 @@ function openHelp() {
     [["↵"], "Switch to that tab"],
     [["y"], "Copy the tab's full URL"],
     [["/"], "Filter"],
-    [["r"], "Re-scan tabs"],
+    [["r"], "Re-scan tabs (only new tabs are sorted)"],
+    [["R"], "Re-sort all tabs from scratch"],
     [["s"], "AI settings"],
-    [["⇧", "↵"], "Apply ticked changes"],
-    [["esc"], "Close dialog / clear filter"],
+    [["⇧", "↵"], "Apply the group under the cursor"],
+    [["esc"], "Clear selection / filter"],
   ];
   showOverlay(`<div class="dialog wide" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
     <header>Keyboard shortcuts<small>Press Esc or ? to close</small></header>
@@ -1168,8 +1168,8 @@ document.addEventListener("keydown", (e) => {
   else if (k === "K") jumpSection(-1);
   else if (k === "g") moveCursor(-1e6);
   else if (k === "G") moveCursor(1e6);
-  else if ((k === "x" || k === " ") && onListOrBody(e)) toggle(r);
-  else if (k === "a") toggleSection();
+  else if ((k === "x" || k === " ") && onListOrBody(e)) toggleSelect(r);
+  else if (k === "#") void markClose();
   else if (k === "h" || k === "ArrowLeft") collapse(r);
   else if (k === "l" || k === "ArrowRight") expand(r);
   else if (k === "m") openMove();
@@ -1183,6 +1183,10 @@ document.addEventListener("keydown", (e) => {
     filterEl.select();
   } else if (k === "?") openHelp();
   else if (k === "r") void rescan().then(() => toast("Re-scanned your tabs."));
+  else if (k === "R") {
+    modelSorter?.forget();
+    void rescan().then(() => toast("Re-sorted all tabs."));
+  }
   else if (k === "y") {
     if (r?.type !== "item") toast("Put the cursor on a tab to copy its URL.");
     else
@@ -1190,13 +1194,16 @@ document.addEventListener("keydown", (e) => {
         () => toast("Copied URL."),
         () => toast("Couldn't copy. The URL is shown at the bottom."),
       );
-  } else if (k === "Enter" && e.shiftKey) openApply();
+  } else if (k === "Enter" && e.shiftKey) void applyGroup();
   else if (k === "Enter" && r && onListOrBody(e)) {
     if (r.type === "item") void switchToTab(r.tabId);
     else {
       S.collapsed.has(r.block.key) ? S.collapsed.delete(r.block.key) : S.collapsed.add(r.block.key);
       render();
     }
+  } else if (k === "Escape" && S.selected.size) {
+    S.selected.clear();
+    render();
   } else if (k === "Escape" && S.filter) {
     filterEl.value = "";
     S.filter = "";
@@ -1211,7 +1218,13 @@ listEl.addEventListener("click", (e) => {
   if (!row || el.closest(".rename")) return;
   setCursor(row.dataset.key!);
   const r = curRow();
-  if (el.closest("[data-cb]")) toggle(r);
+  const apply = el.closest<HTMLElement>("[data-apply]");
+  if (apply) {
+    const b = S.plan && blocksOf(S.plan).find((x) => x.key === apply.dataset.apply);
+    if (b) void applyGroup(b);
+    return;
+  }
+  if (el.closest("[data-cb]")) toggleSelect(r);
   else if (el.closest(".caret") && r?.type === "block") {
     S.collapsed.has(r.block.key) ? S.collapsed.delete(r.block.key) : S.collapsed.add(r.block.key);
     render();
@@ -1224,7 +1237,7 @@ listEl.addEventListener("dblclick", (e) => {
   if (r?.type === "item") void switchToTab(r.tabId);
 });
 
-$("#apply").addEventListener("click", openApply);
+$("#apply").addEventListener("click", () => void applyGroup());
 $("#propose").addEventListener("click", openPropose);
 $("#rescan").addEventListener("click", () => void rescan().then(() => toast("Re-scanned your tabs.")));
 
