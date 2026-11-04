@@ -178,3 +178,5 @@ button.link:focus-visible { outline: 2px solid var(--cursor-edge); outline-offse
 .ab-extra { flex-basis: 100%; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
 
 .version { font-size: 12px; font-weight: 400; color: var(--muted); letter-spacing: 0; }
+
+.aibanner-text .errtext { color: var(--danger); overflow-wrap: anywhere; }

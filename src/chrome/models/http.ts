@@ -26,8 +26,11 @@ export async function fetchOrExplain(url: string, service: string, init: Request
     return await fetch(url, init);
   } catch (e) {
     if (e instanceof DOMException && e.name === "AbortError") throw e;
+    console.error(`${service}: request to ${new URL(url).origin} failed`, e);
     throw new Error(
-      `${service}: couldn't connect. Check the address and your connection. A local server (such as Ollama) may also need to allow requests from extensions, for example by setting OLLAMA_ORIGINS=chrome-extension://*.`,
+      `${service}: the request to ${new URL(url).host} was blocked or couldn't connect (${e instanceof Error ? e.message : String(e)}). ` +
+        `The browser console on this page (F12, then Console) shows the exact reason, such as net::ERR_BLOCKED_BY_CLIENT when a blocker extension stops it. ` +
+        `A local server (such as Ollama) may need to allow requests from extensions, for example with OLLAMA_ORIGINS=chrome-extension://*.`,
     );
   }
 }

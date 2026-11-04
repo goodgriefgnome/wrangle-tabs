@@ -51,7 +51,7 @@ describe("Gemini API", () => {
     vi.stubGlobal("fetch", async () => {
       throw new TypeError("Failed to fetch");
     });
-    await expect(geminiModel({ apiKey: "k", model: "m" }).complete(request)).rejects.toThrow("Gemini API: couldn't connect");
+    await expect(geminiModel({ apiKey: "k", model: "m" }).complete(request)).rejects.toThrow("Gemini API: the request to generativelanguage.googleapis.com was blocked or couldn't connect (Failed to fetch)");
   });
 
   it("explains a rate limit", async () => {

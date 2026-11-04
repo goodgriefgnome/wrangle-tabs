@@ -598,6 +598,13 @@ function renderBanner() {
         : "Chrome says its on-device AI isn't available on this computer. It needs 22 GB of free disk space and either a GPU with more than 4 GB of video memory or 16 GB of RAM. chrome://on-device-internals shows the details.") +
       ` You can use an online model instead.</span>`;
     actions = `<button type="button" data-act="settings">AI settings</button>`;
+  } else if (sorter instanceof ModelSorter && sorter.lastError && sorter.lastFallbackCount && !sorter.stopped) {
+    // The AI was in use but failed: say so up front rather than in a tooltip.
+    const n = sorter.lastFallbackCount;
+    text =
+      `<strong>${esc(sorter.model.name)} failed on ${n} ${n === 1 ? "tab" : "tabs"}, so they're sorted by website</strong>` +
+      `<span class="errtext">${esc(sorter.lastError)}</span>`;
+    actions = `<button type="button" data-act="settings">AI settings</button><button type="button" class="primary" data-act="retry">Try again</button>`;
   } else if ((S.ai.choice === "gemini" || S.ai.choice === "openai") && whyNoAi()) {
     text = `<strong>Tabs are grouped by website for now</strong><span>Because ${esc(whyNoAi()!)}.</span>`;
     actions =
@@ -619,6 +626,10 @@ function onAiAction(e: Event) {
   const act = (e.target as HTMLElement).closest<HTMLElement>("[data-act]")?.dataset.act;
   if (act === "download") void startDownload();
   else if (act === "settings") openAiSettings();
+  else if (act === "retry") {
+    modelSorter?.forget();
+    void rescan();
+  }
   else if (act === "stop") {
     replanStop?.abort();
     toast("Stopped. The tabs the AI hadn't reached are sorted by website.");
