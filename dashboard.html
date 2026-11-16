@@ -9,56 +9,23 @@
   <div class="page">
     <header class="top">
       <h1>Wrangle Tabs <span class="version" id="version"></span></h1>
-      <div class="stats" id="stats"></div>
-      <div class="sorter" id="sorter"></div>
+      <div class="header-actions"><button id="propose">New group<kbd>n</kbd></button><button id="undo" disabled>Undo</button><button id="help" aria-label="Help">?<span class="sr-only"> Help</span></button></div>
     </header>
 
     <div class="grid">
       <main>
-        <div id="aibanner" class="aibanner" hidden><div class="aibanner-text" id="ab-text"></div><div class="ab-actions" id="ab-actions"></div><div class="ab-extra" id="ab-extra"></div></div>
         <div class="filterbar">
           <input id="filter" type="search" placeholder="Filter by title or site  ( / )" aria-label="Filter suggestions" autocomplete="off">
-          <button id="propose" type="button">+ Propose group<kbd>n</kbd></button>
         </div>
         <div id="list" tabindex="0" role="listbox" aria-multiselectable="true" aria-label="Suggested changes">
           <div class="row info">Reading your tabs…</div>
         </div>
       </main>
-      <aside class="rail">
-        <section class="panel" aria-label="Your windows">
-          <h3>Your windows now</h3>
-          <div id="windows"></div>
-        </section>
-        <section class="panel" aria-label="Keyboard shortcuts">
-          <h3>Keys</h3>
-          <div class="keys">
-            <span><kbd>j</kbd><kbd>k</kbd></span><span>Move down / up</span>
-            <span><kbd>J</kbd><kbd>K</kbd></span><span>Next / previous section</span>
-            <span><kbd>⇧</kbd><kbd>↵</kbd></span><span>Apply the group under the cursor</span>
-            <span><kbd>x</kbd><kbd>space</kbd></span><span>Select tab (or a group's tabs)</span>
-            <span><kbd>m</kbd></span><span>Move selected tabs to another group</span>
-            <span><kbd>#</kbd></span><span>Mark selected tabs for closing</span>
-            <span><kbd>u</kbd></span><span>Pull in AI answers that have arrived</span>
-            <span><kbd>R</kbd></span><span>Ask the AI again (group or all)</span>
-            <span><kbd>y</kbd></span><span>Copy full URL</span>
-            <span><kbd>n</kbd></span><span>Propose your own group</span>
-            <span><kbd>d</kbd></span><span>Delete a group you proposed</span>
-            <span><kbd>e</kbd></span><span>Rename new group</span>
-            <span><kbd>c</kbd></span><span>Change group color</span>
-            <span><kbd>s</kbd></span><span>AI settings</span>
-            <span><kbd>?</kbd></span><span>All shortcuts</span>
-          </div>
-        </section>
-      </aside>
     </div>
   </div>
 
-  <div class="applybar"><div class="in">
-    <div class="cururl" id="cururl" aria-live="polite"></div>
-    <div class="summary" id="summary"></div>
-    <button id="rescan" type="button">Re-scan<kbd>r</kbd></button>
-    <button id="apply" class="primary" type="button">Apply group<kbd>⇧↵</kbd></button>
-  </div></div>
+  <footer class="applybar"><div class="in"><div class="cururl" id="cururl"></div><div class="ai-footer"><div class="sorter" id="sorter"></div><button id="settings" aria-label="AI settings">AI settings<kbd>s</kbd></button></div></div></footer>
+
 
   <div id="overlayRoot"></div>
   <div id="toastRoot" aria-live="polite"></div>

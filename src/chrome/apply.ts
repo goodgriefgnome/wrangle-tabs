@@ -16,7 +16,7 @@ export interface ApplyResult {
 /** The tabs from `ids` that still exist. */
 async function live(ids: number[]): Promise<chrome.tabs.Tab[]> {
   const found = await Promise.all(ids.map((id) => chrome.tabs.get(id).catch(() => null)));
-  return found.filter((t): t is chrome.tabs.Tab => t !== null && t.id !== undefined);
+  return found.filter((t): t is chrome.tabs.Tab => t !== null && t.id !== undefined && !t.pinned);
 }
 
 async function moveTo(tabs: chrome.tabs.Tab[], windowId: number): Promise<void> {

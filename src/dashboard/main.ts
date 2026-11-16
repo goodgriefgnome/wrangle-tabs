@@ -1,10 +1,12 @@
 import "./style.css";
+import { stableReview, unresolvedSnapshot } from "../core/review";
+import { execute, restore, type Destination, type UndoRecord } from "../chrome/direct";
 import { applyActions, switchToTab, type Actions } from "../chrome/apply";
 import { takeSnapshot } from "../chrome/snapshot";
 import { missingSetting, modelFor, requestPermission, type AiChoice, type AiSettings, DEFAULT_AI_SETTINGS } from "../chrome/aiSettings";
 import { chromeAiStatus, downloadChromeAi, type ChromeAiStatus } from "../chrome/models/chromeAi";
 import { loadState, saveAiSettings, saveLeftoversWindowId, saveUserGroups } from "../chrome/storage";
-import { ModelSorter, parsePartialAnswer, settle } from "../core/modelSorter";
+import { ModelSorter, settle } from "../core/modelSorter";
 import { buildPlan, sortInputFor, type ManualTarget, type NewGroupPlan, type Plan, type PlanInput } from "../core/plan";
 import { SiteSorter } from "../core/siteSorter";
 import type { Sorter, SortTarget } from "../core/sorter";
@@ -73,6 +75,9 @@ const S = {
   download: null as number | null,
 };
 
+let undoRecord: UndoRecord | null = null;
+const resolved = new Map<number, string>();
+
 const tabs = new Map<number, TabInfo>();
 const groups = new Map<number, GroupInfo>();
 
@@ -109,10 +114,6 @@ function winShort(id: number): string {
   if (id === S.leftoversWindowId) return "Left";
   return "W" + (windowOrder().indexOf(id) + 1);
 }
-function winLong(id: number): string {
-  if (id === S.leftoversWindowId) return "Leftovers";
-  return "Window " + (windowOrder().indexOf(id) + 1);
-}
 
 function majorityWindow(ids: number[]): number | null {
   const counts = new Map<number, number>();
@@ -139,7 +140,7 @@ function toast(msg: string) {
   el.textContent = msg;
   root.replaceChildren(el);
   clearTimeout((toast as { t?: number }).t);
-  (toast as { t?: number }).t = window.setTimeout(() => root.replaceChildren(), 3000);
+  (toast as { t?: number }).t = window.setTimeout(() => root.replaceChildren(), msg.length > 100 ? 8000 : 3000);
 }
 
 /* ---------------------------------------------------------------- rows */
@@ -156,24 +157,13 @@ interface Block {
 }
 
 type Row =
-  | { type: "section"; section: SectionKey; count: number }
   | { type: "info"; text: string; ready?: boolean }
   | { type: "block"; key: string; block: Block }
   | { type: "item"; key: string; section: SectionKey; block: Block; tabId: number };
 
-const SECTIONS: Record<SectionKey, { title: string; hint: string }> = {
-  close: { title: "Close", hint: "Duplicates, and tabs you marked with #. Duplicates in two different groups are never touched." },
-  existing: { title: "Add to your groups", hint: "Your existing groups never lose tabs or get mixed together." },
-  new: {
-    title: "New groups",
-    hint: "Created in the window that already holds most of their tabs. Press n to propose your own.",
-  },
-  left: { title: "Leftovers", hint: "Tabs that don't fit a group go to one window." },
-  wait: { title: "Not sorted yet", hint: "The AI hasn't placed these yet. Press u to pull in its answers as they arrive." },
-};
 const SECTION_ORDER: SectionKey[] = ["close", "existing", "new", "left", "wait"];
 
-const itemKey = (blockKey: string, tabId: number) => `${blockKey}|${tabId}`;
+const itemKey = (_blockKey: string, tabId: number) => `tab:${tabId}`;
 
 function blocksOf(plan: Plan): Block[] {
   return [
@@ -228,8 +218,8 @@ function buildRows(plan: Plan): Row[] {
         (S.filter ? b.tabIds.some(matches) : b.tabIds.length > 0 || b.newGroup?.mine),
     );
     const ghosts = S.filter ? [] : (S.ready.ghosts.get(section) ?? []);
-    if (section === "wait" && !bs.length && !ghosts.length) continue;
-    out.push({ type: "section", section, count: bs.reduce((n, b) => n + b.tabIds.length, 0) });
+    if (!bs.length && !ghosts.length) continue;
+    // Group headers provide the hierarchy without repeating section headings.
     for (const b of bs) {
       out.push({ type: "block", key: b.key, block: b });
       if (!S.collapsed.has(b.key)) {
@@ -238,9 +228,9 @@ function buildRows(plan: Plan): Row[] {
       if (b.newGroup?.mine && !b.tabIds.length) out.push({ type: "info", text: "No matching tabs yet. Move tabs here with m." });
     }
     if (section === "close" && !S.filter) for (const text of plan.notes) out.push({ type: "info", text });
-    if (ghosts.length) out.push({ type: "info", ready: true, text: `Ready to pull in: ${ghosts.join(", ")}. Press u.` });
-    else if (!bs.length) out.push({ type: "info", text: S.filter ? "No matches." : "Nothing to do here." });
+
   }
+  if (!out.length) out.push({ type: "info", text: S.filter ? "No matches." : "All done." });
   return out;
 }
 
@@ -285,10 +275,6 @@ function curBlock(): Block | undefined {
 }
 
 function rowHTML(r: Row): string {
-  if (r.type === "section") {
-    const s = SECTIONS[r.section];
-    return `<div class="sec"><h2>${s.title}</h2><span class="count">${r.count} ${r.count === 1 ? "tab" : "tabs"}</span><span class="hint">${s.hint}</span></div>`;
-  }
   if (r.type === "info") return `<div class="row info${r.ready ? " readyline" : ""}">${esc(r.text)}</div>`;
   const cur = r.key === S.cursor ? " cur" : "";
 
@@ -301,15 +287,15 @@ function rowHTML(r: Row): string {
     let meta = "";
     const win = blockWindow(b);
     if (b.section === "close") {
-      name = `<span class="chip closechip">Close</span>`;
+      name = `<span class="chip closechip">Duplicates</span>`;
     } else if (b.section === "wait") {
-      name = `<span class="chip ghost">Waiting for the AI</span>`;
+      name = `<span class="chip ghost">Unsorted</span>`;
     } else if (b.section === "left") {
-      name = `<span class="chip ghost">Leftovers window</span>`;
+      name = `<span class="chip ghost">Ungrouped</span>`;
       meta = `<span class="win">${win !== null ? winShort(win) : "new window"}</span>`;
     } else if (b.groupId !== undefined) {
       const g = groups.get(b.groupId);
-      name = `<span class="chip outline" style="--c: var(--tg-${g?.color ?? "grey"})">${esc(g?.title || "Unnamed group")}</span>`;
+      name = S.renaming === b.key ? `<input class="rename" id="rename-input" value="${esc(g?.title || "")}" aria-label="Group name">` : `<span class="chip outline" style="--c: var(--tg-${g?.color ?? "grey"})">${esc(g?.title || "Unnamed group")}</span>`;
       meta = `<span class="win">existing${win !== null ? " · " + winShort(win) : ""}</span>`;
     } else {
       const g = b.newGroup!;
@@ -322,11 +308,11 @@ function rowHTML(r: Row): string {
     }
     const ready = S.ready.byBlock.get(b.key);
     if (ready) meta += `<span class="ready">+${ready} ready</span>`;
-    const isCurBlock = curBlock()?.key === b.key;
+    const isCurBlock = !S.selected.size && curBlock()?.key === b.key;
     const apply = b.tabIds.length && b.section !== "wait"
-      ? `<button type="button" class="applybtn${isCurBlock ? " primary" : ""}" data-apply="${esc(b.key)}">${esc(applyLabel(b))}${isCurBlock ? "<kbd>⇧↵</kbd>" : ""}</button>`
+      ? `<button type="button" class="applybtn${isCurBlock ? " primary" : ""}" data-apply="${esc(b.key)}" ${S.selected.size ? "disabled" : ""} aria-label="${esc(applyLabel(b))}">${b.section === "left" ? "Move to window" : b.section === "close" ? "Close duplicates" : "Accept"}${isCurBlock ? "<kbd>⇧↵</kbd>" : ""}</button>`
       : "";
-    return `<div class="row block on-row${cur}" id="${rowId(r.key)}" data-key="${esc(r.key)}" role="option" aria-selected="${st === "on"}">${caret}<span class="cb ${st}" data-cb></span>${name}<span class="title hintx">${esc(hint)}</span>${meta}${apply}</div>`;
+    return `<div class="row block on-row${cur}" id="${rowId(r.key)}" data-key="${esc(r.key)}" role="option" aria-selected="${st === "on"}">${caret}<input type="checkbox" tabindex="-1" class="cb ${st}" data-cb data-partial="${st === "part"}" ${st === "on" ? "checked" : ""} aria-label="Select ${esc(blockName(b))}">${name}<span class="title hintx">${esc(hint)}</span>${meta}${apply}</div>`;
   }
 
   const t = tabs.get(r.tabId);
@@ -339,7 +325,7 @@ function rowHTML(r: Row): string {
     const why = k
       ? `duplicate · keeps ${winShort(k.windowId)}${k.pinned ? " pinned" : ""}${k.groupId !== -1 ? " " + esc(groups.get(k.groupId)?.title || "group") : ""}`
       : "marked by you";
-    tail = `<span class="win">${winShort(t.windowId)} · ${why}</span>`;
+    tail = `<span class="win" title="${esc(k ? `Keeps ${k.title} — ${k.url}` : "Marked for closing")}">${winShort(t.windowId)} · ${why}</span>`;
   } else if (r.section === "wait") {
     const topic = S.plan!.unsorted.find((u) => u.tabId === r.tabId)?.topic;
     const state = S.answered.includes(r.tabId) && !S.pulled.has(r.tabId)
@@ -361,8 +347,8 @@ function rowHTML(r: Row): string {
   }
   return (
     `<div class="row item on-row${on ? " sel" : ""}${cur}" id="${rowId(r.key)}" data-key="${esc(r.key)}" role="option" aria-selected="${on}">` +
-    `<span class="cb ${on ? "on" : ""}" data-cb></span><img class="fav" src="${esc(favicon(t.url))}" alt="">` +
-    `<span class="title">${esc(t.title)}</span><span class="host">${esc(host(t.url))}</span>${tail}</div>`
+    `<input type="checkbox" tabindex="-1" class="cb ${on ? "on" : ""}" data-cb ${on ? "checked" : ""} aria-label="Select ${esc(t.title)}"><img class="fav" src="${esc(favicon(t.url))}" alt="">` +
+    `<span class="title">${esc(t.title)}</span><span class="host">${esc(host(t.url))}</span>${tail}${cur ? `<span class="row-actions"><button data-move aria-label="Move ${S.selected.size ? S.selected.size + " selected tabs" : "tab"}"><span class="action-word">${S.selected.size ? S.selected.size + " · " : ""}Move</span><kbd>m</kbd></button><button data-close-tab aria-label="Close ${S.selected.size ? S.selected.size + " selected tabs" : "tab"}"><span class="action-word">Close</span><kbd>#</kbd></button></span>` : ""}</div>`
   );
 }
 
@@ -380,53 +366,16 @@ function render() {
     S.cursor = nav.length ? nav[Math.min(S.lastIdx, nav.length - 1)].key : null;
   }
   setHTML(listEl, rows.map(rowHTML).join(""));
-  if (S.cursor) {
-    listEl.setAttribute("aria-activedescendant", rowId(S.cursor));
-    document.getElementById(rowId(S.cursor))?.scrollIntoView({ block: "nearest" });
-  }
+  for (const checkbox of listEl.querySelectorAll<HTMLInputElement>("input[data-partial]")) checkbox.indeterminate = checkbox.dataset.partial === "true";
+  if (S.cursor) listEl.setAttribute("aria-activedescendant", rowId(S.cursor));
+  else listEl.removeAttribute("aria-activedescendant");
   if (S.renaming) {
     const input = $<HTMLInputElement>("#rename-input");
     input?.focus();
     input?.select();
   }
-  renderStats();
-  renderWindows();
   renderSummary();
   renderStatusLine();
-}
-
-function renderStats() {
-  const all = [...tabs.values()].filter((t) => !t.pinned);
-  const windows = new Set(all.map((t) => t.windowId));
-  const ungrouped = all.filter((t) => t.groupId === -1 && t.windowId !== S.leftoversWindowId).length;
-  const toClose = S.plan?.close.length ?? 0;
-  const toReview = S.plan ? blocksOf(S.plan).filter((b) => b.tabIds.length && b.section !== "wait").length : 0;
-  $("#stats").innerHTML =
-    `<span><b>${all.length}</b> tabs</span><span><b>${windows.size}</b> windows</span>` +
-    `<span class="warn"><b>${ungrouped}</b> ungrouped</span><span><b>${toClose}</b> to close</span>` +
-    `<span><b>${toReview}</b> ${toReview === 1 ? "group" : "groups"} to review</span>`;
-}
-
-function renderWindows() {
-  const all = [...tabs.values()].filter((t) => !t.pinned);
-  const ids = windowOrder();
-  if (S.leftoversWindowId !== null && all.some((t) => t.windowId === S.leftoversWindowId)) ids.push(S.leftoversWindowId);
-  $("#windows").innerHTML =
-    ids
-      .map((w) => {
-        const inWin = all.filter((t) => t.windowId === w);
-        if (!inWin.length) return "";
-        const chips = [...groups.values()]
-          .filter((g) => g.windowId === w)
-          .map((g) => {
-            const n = inWin.filter((t) => t.groupId === g.id).length;
-            return `<span class="chip" style="--c: var(--tg-${g.color})">${esc(g.title || "Unnamed")} ${n}</span>`;
-          })
-          .join("");
-        const loose = inWin.filter((t) => t.groupId === -1).length;
-        return `<div class="wnd"><div class="wname">${winLong(w)}<span>${inWin.length} ${inWin.length === 1 ? "tab" : "tabs"}</span></div><div class="chips">${chips}${loose ? `<span class="chip ghost">${loose} ungrouped</span>` : ""}</div></div>`;
-      })
-      .join("") || `<div class="row info">No tabs.</div>`;
 }
 
 /** The changes that applying one block makes. */
@@ -440,40 +389,12 @@ function blockActions(b: Block): Actions {
 }
 
 function renderSummary() {
-  const n = S.selected.size;
-  const b = curBlock();
-  $("#summary").innerHTML = n
-    ? `<b>${n}</b> ${n === 1 ? "tab" : "tabs"} selected · <kbd>m</kbd> move · <kbd>#</kbd> close · <kbd>esc</kbd> clear`
-    : b?.section === "wait"
-      ? "These tabs are waiting for the AI. You can still move them yourself with m."
-      : b?.tabIds.length
-      ? `Looks right? <kbd>⇧↵</kbd> applies “${esc(blockName(b))}”.`
-      : "Move the cursor to a group to review it.";
-  const apply = $<HTMLButtonElement>("#apply");
-  const can = !!b?.tabIds.length && b.section !== "wait";
-  apply.disabled = !can || S.busy;
-  apply.innerHTML = `${can ? esc(applyLabel(b!)) : "Apply group"}<kbd>⇧↵</kbd>`;
+  $("#undo").toggleAttribute("disabled", !undoRecord || S.busy);
 }
 
 function renderStatusLine() {
-  const el = $("#cururl");
   const r = curRow();
-  if (!r) {
-    el.innerHTML = `<span class="url">Nothing selected</span>`;
-    return;
-  }
-  if (r.type === "block") {
-    el.innerHTML = `<span class="url">Group: ${esc(blockName(r.block))}</span>`;
-    return;
-  }
-  const t = tabs.get(r.tabId);
-  let html = `<span class="url main">${esc(t?.url ?? "")}</span>`;
-  if (r.section === "close") {
-    const keepId = S.plan!.close.find((c) => c.tabId === r.tabId)?.keepId;
-    const k = keepId !== undefined ? tabs.get(keepId) : undefined;
-    html += `<span class="url">${k ? `Duplicate. Keeps ${esc(k.url)}` : "Marked for closing by you. Move it with m to keep it."}</span>`;
-  } else html += `<span class="url">${esc(sortExplanation(r.tabId))}</span>`;
-  el.innerHTML = html;
+  $("#cururl").textContent = r?.type === "item" ? tabs.get(r.tabId)?.url ?? "" : "";
 }
 
 /** Why sorting falls back to websites with the current AI settings, or null when the AI is in use. */
@@ -494,45 +415,26 @@ function whyNoAi(): string | null {
   return null;
 }
 
-/** One line on how the current tab was sorted, for checking the AI's work. */
-function sortExplanation(tabId: number): string {
-  if (S.manual.has(tabId)) return "Placed by you. Press m and choose “Let the sorter decide” to undo.";
-  const sorter = activeSorter();
-  if (!(sorter instanceof ModelSorter)) return `Sorted by website: ${whyNoAi()}.`;
-  const t = tabs.get(tabId);
-  if (!t) return "";
-  const status = sorter.statusOf(t);
-  if (status === "answered") {
-    const about = `AI: about “${sorter.subjectOf(tabId) ?? "?"}”`;
-    if (!S.pulled.has(tabId)) return `${about}. Its answer is ready: press u to pull it in.`;
-    const topic = S.plan?.unsorted.find((u) => u.tabId === tabId)?.topic;
-    if (topic) return `${about}, heading for “${topic}”, which has no other tabs yet. It goes to Leftovers if none join.`;
-    return about;
-  }
-  if (status === "skipped") return "AI: stopped before it reached this tab, so it was sorted by website. Press R to ask again.";
-  if (status === "failed") {
-    const err = sorter.lastError;
-    return `AI: no answer for this tab, so it was sorted by website. Press R to ask again.${err ? ` Error: ${err}` : ""}`;
-  }
-  return S.sorting?.tabIds?.includes(tabId) ? "The AI is reading this tab now." : "Waiting for the AI.";
-}
-
 /* ---------------------------------------------------------------- data */
 
 async function rescan() {
-  S.snapshot = await takeSnapshot(S.leftoversWindowId);
+  try { S.snapshot = await takeSnapshot(S.leftoversWindowId); }
+  catch (e) { toast(`Couldn't read tabs: ${e instanceof Error ? e.message : e}`); return; }
   if (S.snapshot.leftoversWindowId !== S.leftoversWindowId) {
     S.leftoversWindowId = S.snapshot.leftoversWindowId;
     await saveLeftoversWindowId(S.leftoversWindowId);
   }
   tabs.clear();
   for (const t of S.snapshot.tabs) tabs.set(t.id, t);
+  for (const id of S.selected) if (!tabs.has(id)) S.selected.delete(id);
   groups.clear();
   for (const g of S.snapshot.groups) groups.set(g.id, g);
-  // Forget hand moves for tabs that are gone or already grouped.
+  const remainingUserGroups = S.userGroups.filter(user => !S.snapshot!.groups.some(group => group.title === user.name));
+  if (remainingUserGroups.length !== S.userGroups.length) { S.userGroups = remainingUserGroups; await saveUserGroups(S.userGroups); }
+  // Forget hand moves for tabs that are gone.
   for (const id of S.manual.keys()) {
     const t = tabs.get(id);
-    if (!t || t.groupId !== -1) S.manual.delete(id);
+    if (!t) S.manual.delete(id);
   }
   await refresh();
 }
@@ -547,7 +449,7 @@ function activeSorter(): Sorter {
 }
 
 function planInput(): PlanInput {
-  return { snapshot: S.snapshot!, userGroups: S.userGroups, manual: S.manual, aiOverrides: S.aiOverrides };
+  return { snapshot: unresolvedSnapshot(S.snapshot!, resolved), userGroups: S.userGroups, manual: S.manual, aiOverrides: S.aiOverrides };
 }
 
 /**
@@ -631,6 +533,7 @@ let refreshGeneration = 0;
 async function refresh() {
   if (!S.snapshot) return;
   const generation = ++refreshGeneration;
+  const previous = S.plan;
   const input = planInput();
   const sortInput = sortInputFor(input);
   const sorter = activeSorter();
@@ -663,6 +566,7 @@ async function refresh() {
     S.plan = view(new Map([...all].filter(([id]) => S.pulled.has(id))));
     S.arrived = view(all);
   }
+  S.plan = stableReview(previous, S.plan);
   S.ready = S.arrived ? computeReady(S.plan, S.arrived) : NO_READY;
   render();
 }
@@ -671,12 +575,18 @@ async function refresh() {
 async function pull() {
   if (!S.ready.total) return toast(S.sorting ? "Nothing new yet. The AI is still working." : "Nothing new to pull in.");
   const n = S.ready.total;
+  const anchor = S.cursor ? document.getElementById(rowId(S.cursor)) : null;
+  const anchorTop = anchor?.getBoundingClientRect().top;
+  const oldScroll = window.scrollY;
   const was = S.cursor;
   const before = navRows().map((r) => r.key);
   const at = before.indexOf(was ?? "");
   const r = curRow();
   const follow = r?.type === "item" && r.section !== "wait" ? r.tabId : null;
   for (const id of S.answered) S.pulled.add(id);
+  if (r?.type === "item" && S.arrived) {
+    for (const block of blocksOf(S.arrived)) if (block.tabIds.includes(r.tabId)) S.collapsed.delete(block.key);
+  }
   await refresh();
   const now = navRows();
   if (!now.some((x) => x.key === was)) {
@@ -688,7 +598,9 @@ async function pull() {
       render();
     }
   }
-  toast(`Pulled in ${n} ${n === 1 ? "answer" : "answers"}.`);
+  const newTop = was ? document.getElementById(rowId(was))?.getBoundingClientRect().top : undefined;
+  if (anchorTop !== undefined && newTop !== undefined) window.scrollTo(0, oldScroll + newTop - anchorTop);
+  toast(`Imported ${n}.`);
 }
 
 /** Forgets every AI answer and sorts all tabs again; answers come in as they arrive. */
@@ -698,7 +610,6 @@ function resortAll() {
     modelSorter.forget();
   }
   S.pulled.clear();
-  S.autoPull = true;
   void refresh();
 }
 
@@ -736,11 +647,6 @@ function openResort() {
   openPicker("Ask the AI again about…", opts);
 }
 
-/** Complete `{ tab, subject, group }` answers in a partly streamed model answer, in order. */
-function answeredTabs(output: string): { tab: number; subject: string; group: string }[] {
-  return [...parsePartialAnswer(output)].map(([tab, a]) => ({ tab, ...a }));
-}
-
 /** A prominent notice above the list: AI progress, or why tabs are only grouped by website. */
 /** Sets an element's HTML only when it changed, so buttons inside aren't replaced mid-click. */
 const lastHTML = new WeakMap<Element, string>();
@@ -751,93 +657,9 @@ function setHTML(el: Element, html: string) {
 }
 
 function renderBanner() {
-  const el = $("#aibanner");
-  let text = "";
-  let actions = "";
-  let extra = "";
-  let muted = false;
   const sorter = activeSorter();
-  const name = sorter instanceof ModelSorter ? sorter.model.name : "AI";
-  const bar = (pct: number) =>
-    `<div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><div style="width:${pct}%"></div></div>`;
-  if (S.sorting) {
-    const p = S.sorting;
-    const finishedAnswers = answeredTabs(p.output ?? "");
-    // Tabs the model has finished answering in the current batch, counted from the streamed answer.
-    const done = Math.min(p.total, p.done + Math.min(p.input?.length ?? 0, finishedAnswers.length));
-    const pct = p.total ? Math.round((done / p.total) * 100) : 0;
-    const secs = p.batchStart ? Math.floor((Date.now() - p.batchStart) / 1000) : 0;
-    // The answers the model has finished so far, newest last, as "title → subject → group".
-    const finished = finishedAnswers.map((a) => {
-      const id = a.group.trim().toUpperCase().replace(/\s+/g, "");
-      const group = /^none$/i.test(a.group.trim()) ? "Leftovers" : (p.groupIds?.[id] ?? a.group);
-      return `${p.input?.[a.tab - 1] ?? `Tab ${a.tab}`} → “${a.subject}” → ${group}`;
-    });
-    const outLines = p.error
-      ? [`<span class="txt err">failed: ${esc(p.error)}</span>`]
-      : finished.length
-        ? finished.slice(-3).map((line) => `<span class="txt">${esc(line)}</span>`)
-        : [`<span class="txt muted">${esc(p.status ?? (p.output ? "The model is writing its answer…" : "Waiting for the model…"))}</span>`];
-    text =
-      `<strong>Sorting with ${esc(name)}… ${done} of ${p.total} tabs</strong>` +
-      `<span>${p.input ? `This batch: ${p.input.length} tabs, ${secs} s so far` : "Starting the model…"}</span>`;
-    const n = S.ready.total;
-    if (n) text += `<span>${n} ${n === 1 ? "answer is" : "answers are"} ready to pull in.</span>`;
-    actions =
-      `<button type="button" data-act="settings">AI settings</button>` +
-      `<button type="button" data-act="stop" title="The tabs not sorted yet are sorted by website">Stop</button>` +
-      (n ? `<button type="button" class="primary" data-act="pull">Pull in ${n}<kbd>u</kbd></button>` : "");
-    extra =
-      bar(pct) +
-      (p.input
-        ? `<div class="modelio"><div><span class="dir">in</span><span class="txt">${esc(p.input.join(" · "))}</span></div>` +
-          outLines.map((line, i) => `<div><span class="dir">${i === 0 ? "out" : ""}</span>${line}</div>`).join("") +
-          `</div>`
-        : "");
-  } else if (S.ready.total) {
-    const n = S.ready.total;
-    text = `<strong>The AI is done: ${n} ${n === 1 ? "answer is" : "answers are"} ready to pull in</strong><span>They're shown in the list once you pull them in.</span>`;
-    actions = `<button type="button" class="primary" data-act="pull">Pull in ${n}<kbd>u</kbd></button>`;
-  } else if (S.download !== null) {
-    const pct = Math.round(S.download * 100);
-    text =
-      `<strong>Downloading Chrome's on-device AI model… ${pct}%</strong>` +
-      `<span>Tabs stay grouped by website until it finishes. You can keep using this page meanwhile.</span>`;
-    actions = `<button type="button" data-act="settings">AI settings</button>`;
-    extra = bar(pct);
-  } else if (S.ai.choice === "chrome" && (S.aiStatus === "downloadable" || S.aiStatus === "downloading")) {
-    text =
-      `<strong>Tabs are grouped by website for now</strong>` +
-      `<span>Download Chrome's on-device AI model to group them by subject instead. It's a one-time download of a few GB. It runs on this computer, and your tabs are never sent anywhere. Or use an online model in AI settings.</span>`;
-    actions =
-      `<button type="button" data-act="settings">AI settings</button>` +
-      `<button type="button" class="primary" data-act="download">${S.aiStatus === "downloading" ? "Finish downloading" : "Download AI model"}</button>`;
-  } else if (S.ai.choice === "chrome" && (S.aiStatus === "unavailable" || S.aiStatus === "unsupported")) {
-    muted = true;
-    text =
-      `<strong>Tabs are grouped by website</strong><span>` +
-      (S.aiStatus === "unsupported"
-        ? "Chrome's on-device AI needs Chrome 138 or later."
-        : "Chrome says its on-device AI isn't available on this computer. It needs 22 GB of free disk space and either a GPU with more than 4 GB of video memory or 16 GB of RAM. chrome://on-device-internals shows the details.") +
-      ` You can use an online model instead.</span>`;
-    actions = `<button type="button" data-act="settings">AI settings</button>`;
-  } else if (sorter instanceof ModelSorter && sorter.lastError && sorter.lastFallbackCount && !sorter.stopped) {
-    // The AI was in use but failed: say so up front rather than in a tooltip.
-    const n = sorter.lastFallbackCount;
-    text =
-      `<strong>${esc(sorter.model.name)} failed on ${n} ${n === 1 ? "tab" : "tabs"}, so they're sorted by website</strong>` +
-      `<span class="errtext">${esc(sorter.lastError)}</span>`;
-    actions = `<button type="button" data-act="settings">AI settings</button><button type="button" class="primary" data-act="retry">Try again</button>`;
-  } else if ((S.ai.choice === "gemini" || S.ai.choice === "openai") && whyNoAi()) {
-    text = `<strong>Tabs are grouped by website for now</strong><span>Because ${esc(whyNoAi()!)}.</span>`;
-    actions =
-      `<button type="button" data-act="settings">AI settings</button>`;
-  }
-  el.classList.toggle("muted", muted);
-  el.hidden = !text;
-  setHTML($("#ab-text"), text);
-  setHTML($("#ab-actions"), actions);
-  setHTML($("#ab-extra"), extra);
+  const error = sorter instanceof ModelSorter ? sorter.lastError : undefined;
+  $("#sorter").title = error ?? "";
 }
 
 // Keeps the "so far" seconds counting while the model works on a batch.
@@ -861,26 +683,18 @@ function onAiAction(e: Event) {
     toast("Stopped. The tabs the AI hadn't reached are sorted by website.");
   }
 }
-$("#aibanner").addEventListener("click", onAiAction);
 $("#sorter").addEventListener("click", onAiAction);
 
 function renderSorter() {
   renderBanner();
-  const el = $("#sorter");
-  const settings = `<button type="button" class="link" data-act="settings">AI settings</button>`;
+  const ready = S.ready.total;
   const sorter = activeSorter();
-  if (S.sorting) {
-    setHTML(el, `Sorting with ${esc(sorter instanceof ModelSorter ? sorter.model.name : "AI")}… · ${settings}`);
-  } else if (S.download !== null) {
-    setHTML(el, `Downloading the AI model… ${Math.round(S.download * 100)}%`);
-  } else if (sorter instanceof ModelSorter) {
-    const fb = sorter.lastFallbackCount;
-    const err = sorter.lastError;
-    const why = sorter.stopped ? "you stopped the AI" : "the AI failed on them";
-    setHTML(el, `${esc(sorter.label)}${fb ? ` <span${err ? ` title="${esc(err)}"` : ""}>(${fb} by website, ${why})</span>` : ""} · ${settings}`);
-  } else {
-    setHTML(el, `Sorted by website · ${settings}`);
-  }
+  const name = sorter instanceof ModelSorter ? sorter.model.name : "Website";
+  const fallback = sorter instanceof ModelSorter ? sorter.lastFallbackCount : 0;
+  const error = sorter instanceof ModelSorter ? sorter.lastError : null;
+  const unavailable = whyNoAi();
+  const status = S.sorting ? `${name} · Sorting ${S.sorting.done}/${S.sorting.total}` : S.download !== null ? `Downloading ${Math.round(S.download * 100)}%` : error ? `${name} · ${fallback} by website · AI error` : ready ? `${name} · Finished` : unavailable && S.ai.choice !== "site" ? "Website · AI unavailable" : `${name} · Up to date`;
+  setHTML($("#sorter"), `<span class="ai-status">${esc(status)}</span><span class="ai-actions">${ready ? `<button data-act="pull">Import ${ready} ready<kbd>u</kbd></button>` : ""}${S.sorting ? `<button data-act="stop">Stop</button>` : ""}</span>`);
 }
 
 /** Applies new AI settings and re-sorts. */
@@ -888,7 +702,6 @@ async function setAiSettings(ai: AiSettings) {
   S.ai = ai;
   modelSorter = null;
   S.pulled.clear();
-  S.autoPull = true;
   await saveAiSettings(ai);
   if (ai.choice === "chrome") S.aiStatus = await chromeAiStatus();
   renderSorter();
@@ -911,8 +724,7 @@ async function startDownload(resume = false) {
     // Only re-sort; never change the choice, which the user may have changed meanwhile.
     modelSorter = null;
     S.pulled.clear();
-    S.autoPull = true;
-    renderSorter();
+      renderSorter();
     await refresh();
   } catch (e) {
     S.download = null;
@@ -955,6 +767,9 @@ function openAiSettings() {
           field("ai-openai-model", "Model", a.openai.model, ' placeholder="e.g. google/gemma-4-31b-it:free"'),
       )}
       ${radio("site", "No AI", "Group tabs by website.")}
+      ${activeSorter() instanceof ModelSorter && modelSorter?.lastError ? `<p class="error">${esc(modelSorter.lastError)}</p>` : ""}
+      ${whyNoAi() ? `<p>${esc(whyNoAi()!)}</p>` : ""}
+      ${S.aiStatus === "downloadable" || S.aiStatus === "downloading" ? `<button type="button" id="ai-download">Download on-device model</button>` : ""}
       <p class="error" id="ai-error" hidden></p>
     </div>
     <footer><button type="button" id="ai-cancel">Cancel<kbd>esc</kbd></button><button type="button" class="primary" id="ai-save">Save<kbd>↵</kbd></button></footer></div>`);
@@ -986,10 +801,11 @@ function openAiSettings() {
   };
   S.modal = (e) => {
     if (e.key === "Escape") closeModal();
-    else if (e.key === "Enter" && !(e.target as HTMLElement).closest("a")) void save();
+    else if (e.key === "Enter" && !(e.target as HTMLElement).closest("a, button")) void save();
     else return;
     e.preventDefault();
   };
+  document.querySelector("#ai-download")?.addEventListener("click", () => { closeModal(); void startDownload(); });
   $("#ai-save").addEventListener("click", () => void save());
   $("#ai-cancel").addEventListener("click", closeModal);
   document.querySelector<HTMLInputElement>('input[name="ai-choice"]:checked')?.focus();
@@ -1005,6 +821,7 @@ function setCursor(key: string | null) {
   S.cursor = key;
   const idx = navRows().findIndex((r) => r.key === key);
   if (idx >= 0) S.lastIdx = idx;
+  requestAnimationFrame(() => { if (!S.modal) document.getElementById(rowId(key ?? ""))?.scrollIntoView({ block: "nearest" }); });
 }
 
 function moveCursor(d: number) {
@@ -1016,22 +833,12 @@ function moveCursor(d: number) {
   render();
 }
 
-function sectionOf(r: Extract<Row, { key: string }>): SectionKey {
-  return r.type === "block" ? r.block.section : r.section;
-}
-
 function jumpSection(d: number) {
-  const nav = navRows();
-  const cur = curRow();
-  const ci = SECTION_ORDER.indexOf(cur ? sectionOf(cur) : "close");
-  for (let s = ci + d; s >= 0 && s < SECTION_ORDER.length; s += d) {
-    const first = nav.find((r) => sectionOf(r) === SECTION_ORDER[s]);
-    if (first) {
-      setCursor(first.key);
-      render();
-      return;
-    }
-  }
+  const headers = navRows().filter(r => r.type === "block");
+  const key = curBlock()?.key;
+  const at = headers.findIndex(r => r.key === key);
+  const next = headers[Math.max(0, Math.min(headers.length - 1, at + d))];
+  if (next) { setCursor(next.key); render(); }
 }
 
 /** Selects or unselects a tab, or all of a group's tabs. */
@@ -1051,35 +858,48 @@ function actionTabs(): number[] {
 }
 
 /** Puts tabs where the user said, keeps them there through re-sorts, and clears the selection. */
-async function moveTabs(ids: number[], target: ManualTarget) {
-  // Keep the cursor where it was: on the next row that isn't moving, so you can carry on down the group.
-  const nav = navRows();
-  const at = nav.findIndex((r) => r.key === S.cursor);
-  const stays = (r: (typeof nav)[number]) => r.type === "block" || !ids.includes(r.tabId);
-  const next = nav.slice(at).find(stays) ?? nav.slice(0, at).reverse().find(stays);
-  for (const id of ids) S.manual.set(id, target);
-  S.selected.clear();
-  await refresh();
-  if (next && navRows().some((r) => r.key === next.key)) {
-    setCursor(next.key);
-    render();
-  }
+async function direct(ids: number[], destination: Destination) {
+  if (S.busy || !ids.length) return;
+  S.busy = true;
+  S.autoPull = false;
+  try {
+    const result = await execute(ids, destination);
+    if (result.undo.originals.length) undoRecord = result.undo;
+    for (const id of result.succeeded) {
+      const tab = tabs.get(id);
+      if (tab) resolved.set(id, tab.url);
+      S.selected.delete(id);
+    }
+    await chrome.storage.session.set({ resolved: [...resolved] });
+    toast(result.errors.length ? result.errors.join("; ") : destination.kind === "close" ? `Closed ${result.succeeded.length}. Undo reopens URLs.` : `Moved ${result.succeeded.length}.`);
+  } catch (e) { toast(`Couldn't complete action: ${e instanceof Error ? e.message : e}`); }
+  finally { S.busy = false; await rescan(); }
 }
 
-/** # : marks tabs for closing, or unmarks tabs already marked. */
+async function undo() {
+  if (!undoRecord || S.busy) return;
+  S.busy = true;
+  try {
+    const result = await restore(undoRecord);
+    for (const id of result.restored) resolved.delete(id);
+    undoRecord.originals = undoRecord.originals.filter(o => !result.restored.includes(o.tab.id!));
+    if (!undoRecord.originals.length && !undoRecord.groupChange) undoRecord = null;
+    await chrome.storage.session.set({ resolved: [...resolved] });
+    toast(result.errors.length ? result.errors.join("; ") : "Undone.");
+  } catch (e) { toast(`Couldn't undo: ${e instanceof Error ? e.message : e}`); } finally { S.busy = false; await rescan(); }
+}
+
+async function moveTabs(ids: number[], target: ManualTarget) {
+  if (target.kind === "new") {
+    const group = S.plan?.newGroups.find(g => g.key === target.key);
+    if (group) await direct(ids, { kind: "new", name: group.name, color: group.color });
+  } else await direct(ids, target.kind === "left" ? { kind: "ungrouped" } : target);
+}
+
 async function markClose() {
   const ids = actionTabs();
-  if (!ids.length) return toast("Put the cursor on a tab, or select tabs with x, first.");
-  const marked = ids.filter((id) => S.manual.get(id)?.kind === "close");
-  if (marked.length === ids.length) {
-    for (const id of ids) S.manual.delete(id);
-    S.selected.clear();
-    await refresh();
-    toast(`Unmarked ${ids.length} ${ids.length === 1 ? "tab" : "tabs"}.`);
-    return;
-  }
-  await moveTabs(ids, { kind: "close" });
-  toast(`${ids.length} ${ids.length === 1 ? "tab" : "tabs"} will close when you apply the Close group.`);
+  if (!ids.length) return toast("Focus or select tabs first.");
+  await direct(ids, { kind: "close" });
 }
 
 function collapse(r = curRow()) {
@@ -1102,6 +922,11 @@ function newGroupOf(r: Extract<Row, { key: string }> | undefined): NewGroupPlan 
 
 async function cycleColor() {
   const r = curRow();
+  if (r?.block.groupId !== undefined) {
+    const g = groups.get(r.block.groupId)!;
+    await updateExisting(g.id, { color: GROUP_COLORS[(GROUP_COLORS.indexOf(g.color) + 1) % GROUP_COLORS.length] });
+    return;
+  }
   const g = newGroupOf(r);
   if (!g) return toast(r?.block.section === "existing" ? "Existing groups keep their color." : "Put the cursor on a new group first.");
   const color = GROUP_COLORS[(GROUP_COLORS.indexOf(g.color) + 1) % GROUP_COLORS.length];
@@ -1119,8 +944,22 @@ async function updateNewGroup(g: NewGroupPlan, change: { name?: string; color?: 
   await refresh();
 }
 
+async function updateExisting(id: number, change: { title?: string; color?: GroupColor }) {
+  if (S.busy) return;
+  S.busy = true;
+  try {
+    const before = await chrome.tabGroups.get(id);
+    await chrome.tabGroups.update(id, change);
+    const after = await chrome.tabGroups.get(id);
+    undoRecord = { originals: [], groupChange: { before, after } };
+    toast("Updated group.");
+  } catch (e) { toast(`Couldn't update group: ${e instanceof Error ? e.message : e}`); }
+  finally { S.busy = false; await rescan(); }
+}
+
 function startRename() {
   const r = curRow();
+  if (r?.block.groupId !== undefined) { S.renaming = r.block.key; setCursor(S.renaming); render(); return; }
   const g = newGroupOf(r);
   if (!g) return toast(r?.block.section === "existing" ? "Rename existing groups in Chrome itself." : "Put the cursor on a new group first.");
   S.renaming = `new:${g.key}`;
@@ -1135,7 +974,8 @@ async function finishRename(save: boolean) {
   const value = input?.value.trim() ?? "";
   S.renaming = null;
   const g = S.plan?.newGroups.find((x) => `new:${x.key}` === key);
-  if (save && g && value && value !== g.name) await updateNewGroup(g, { name: value });
+  if (save && value && key.startsWith("existing:")) await updateExisting(Number(key.slice(9)), { title: value });
+  else if (save && g && value && value !== g.name) await updateNewGroup(g, { name: value });
   else render();
   listEl.focus();
 }
@@ -1160,13 +1000,6 @@ function nextUserColor(): GroupColor {
   return GROUP_COLORS.find((c) => c !== "grey" && !used.has(c)) ?? GROUP_COLORS[(S.userGroups.length + 1) % GROUP_COLORS.length];
 }
 
-async function addUserGroup(name: string, hint: string): Promise<UserGroup> {
-  const g: UserGroup = { id: crypto.randomUUID(), name, hint, color: nextUserColor() };
-  S.userGroups = [g, ...S.userGroups];
-  await saveUserGroups(S.userGroups);
-  return g;
-}
-
 async function deleteUserGroup() {
   const g = newGroupOf(curRow());
   if (!g?.mine) return toast("Only groups you proposed can be deleted.");
@@ -1183,10 +1016,13 @@ async function deleteUserGroup() {
 function closeModal() {
   $("#overlayRoot").replaceChildren();
   S.modal = null;
-  listEl.focus();
+  (modalReturn?.isConnected && modalReturn !== document.body ? modalReturn : listEl).focus();
 }
 
+let modalReturn: HTMLElement | null = null;
 function showOverlay(html: string): HTMLElement {
+  S.autoPull = false;
+  modalReturn = document.activeElement as HTMLElement;
   const root = $("#overlayRoot");
   root.innerHTML = `<div class="overlay" data-close>${html}</div>`;
   root.querySelector("[data-close]")!.addEventListener("mousedown", (e) => {
@@ -1279,64 +1115,29 @@ function openMove() {
     if (key === currentKey) continue;
     opts.push({ label: g.name, color: g.color, meta: g.mine ? "yours" : "new", go: () => moveTo({ kind: "new", key: g.key }) });
   }
-  if (currentKey !== "left") opts.push({ label: "Leftovers window", meta: "", go: () => moveTo({ kind: "left" }) });
+  if (currentKey !== "left") opts.push({ label: "Leave ungrouped", meta: "keep in original window", go: () => moveTo({ kind: "left" }) });
   if (currentKey !== "close") opts.push({ label: "Close", meta: "#", go: () => moveTo({ kind: "close" }) });
-  opts.push({
-    label: "New group…",
-    meta: "",
-    go: async () => {
-      const g = await addUserGroup("New group", "");
-      await moveTabs(ids, { kind: "new", key: `user:${g.id}` });
-      S.renaming = `new:user:${g.id}`;
-      setCursor(S.renaming);
-      render();
-    },
-  });
-  if (ids.some((id) => S.manual.has(id))) {
-    opts.push({
-      label: "Let the sorter decide",
-      meta: "undo your move",
-      go: async () => {
-        for (const id of ids) S.manual.delete(id);
-        S.selected.clear();
-        await refresh();
-      },
-    });
-  }
+  opts.push({ label: "New group…", meta: "", go: () => openPropose(ids) });
   const what = ids.length === 1 ? `“${esc(tabs.get(ids[0])?.title ?? "")}”` : `${ids.length} tabs`;
   openPicker(`Move ${what}`, opts);
 }
 
-function openPropose() {
-  showOverlay(`<div class="dialog" role="dialog" aria-modal="true" aria-label="Propose a group">
-    <header>Propose a group<small>Ungrouped tabs are re-sorted to fill it. Tab to switch fields · Enter to add · Esc to cancel</small></header>
-    <input id="pg-name" placeholder="Name, e.g. Weekend reading" autocomplete="off" aria-label="Group name">
-    <input id="pg-hint" placeholder="Optional hint, e.g. hacker news, wikipedia, articles" autocomplete="off" aria-label="Hint for the sorter">
-    <footer><button type="button" id="pg-cancel">Cancel<kbd>esc</kbd></button><button type="button" class="primary" id="pg-go">Add group<kbd>↵</kbd></button></footer></div>`);
-  const go = async () => {
+function openPropose(ids = actionTabs()) {
+  if (!ids.length) return toast("Focus or select tabs to create a group.");
+  showOverlay(`<div class="dialog" role="dialog" aria-modal="true" aria-label="New group"><header>New group<small>${ids.length} ${ids.length === 1 ? "tab" : "tabs"}</small></header><input id="pg-name" placeholder="Group name" autocomplete="off" aria-label="Group name"><footer><button id="pg-cancel">Cancel</button><button class="primary" id="pg-go">Create<kbd>↵</kbd></button></footer></div>`);
+  const go = () => {
     const name = $<HTMLInputElement>("#pg-name").value.trim();
-    if (!name) {
-      $("#pg-name").focus();
-      return;
-    }
-    const hint = $<HTMLInputElement>("#pg-hint").value.trim();
+    if (!name) return;
     closeModal();
-    const g = await addUserGroup(name, hint);
-    // Sort every tab again, so the new group can collect the tabs that fit it.
-    resortAll();
-    await refresh();
-    setCursor(`new:user:${g.id}`);
-    render();
-    const n = S.plan!.newGroups.find((x) => x.key === `user:${g.id}`)?.tabIds.length ?? 0;
-    toast(job ? `Added “${name}”. The AI is sorting your tabs again to fill it.` : n ? `${n} tab${n > 1 ? "s" : ""} sorted into “${name}”.` : `Added “${name}”. No tabs matched yet.`);
+    void direct(ids, { kind: "new", name, color: nextUserColor() });
   };
-  S.modal = (e) => {
+  S.modal = e => {
     if (e.key === "Escape") closeModal();
-    else if (e.key === "Enter") void go();
+    else if (e.key === "Enter") go();
     else return;
     e.preventDefault();
   };
-  $("#pg-go").addEventListener("click", () => void go());
+  $("#pg-go").addEventListener("click", go);
   $("#pg-cancel").addEventListener("click", closeModal);
   $("#pg-name").focus();
 }
@@ -1345,62 +1146,58 @@ function openPropose() {
 async function applyGroup(b = curBlock()) {
   if (b?.section === "wait") return toast("These tabs are waiting for the AI. Move them yourself with m, or wait.");
   if (!b || !b.tabIds.length) return toast("Put the cursor on a group with tabs to apply it.");
+  if (S.selected.size) return toast("Clear selection to accept a group.");
+  if (b.section === "close") return direct(b.tabIds, { kind: "close" });
+  if (b.groupId !== undefined) return direct(b.tabIds, { kind: "existing", groupId: b.groupId });
+  if (b.newGroup) return direct(b.tabIds, { kind: "new", name: b.newGroup.name, color: b.newGroup.color });
+  // Moving unmatched tabs into a window is an explicit optional action.
   if (S.busy) return;
   S.busy = true;
-  const label = applyLabel(b);
-  renderSummary();
   try {
     const result = await applyActions(blockActions(b), S.leftoversWindowId);
-    if (result.leftoversWindowId !== S.leftoversWindowId) {
-      S.leftoversWindowId = result.leftoversWindowId;
-      await saveLeftoversWindowId(S.leftoversWindowId);
-    }
-    // A proposed group that now exists in Chrome is done.
-    if (b.newGroup?.mine) {
-      S.userGroups = S.userGroups.filter((u) => `user:${u.id}` !== b.newGroup!.key);
-      await saveUserGroups(S.userGroups);
-    }
+    S.leftoversWindowId = result.leftoversWindowId;
+    await saveLeftoversWindowId(S.leftoversWindowId);
     for (const id of b.tabIds) {
-      S.manual.delete(id);
-      S.selected.delete(id);
+      const tab = await chrome.tabs.get(id).catch(() => null);
+      if (tab && !tab.pinned && tab.windowId === S.leftoversWindowId && tab.groupId === -1) resolved.set(id, tab.url ?? "");
     }
-    toast(result.errors.length ? `Done, with problems: ${result.errors.join("; ")}` : `Done: ${label}.`);
-  } finally {
-    S.busy = false;
-    await rescan();
-  }
+    await chrome.storage.session.set({ resolved: [...resolved] });
+    toast(result.errors.length ? result.errors.join("; ") : "Moved to Leftovers window.");
+  } finally { S.busy = false; await rescan(); }
 }
 
 function openHelp() {
   const keys: [string[], string][] = [
     [["j", "↓"], "Next row"],
     [["k", "↑"], "Previous row"],
-    [["J"], "Next section"],
-    [["K"], "Previous section"],
+    [["J"], "Next group"],
+    [["K"], "Previous group"],
     [["g"], "First row"],
     [["G"], "Last row"],
     [["h", "←"], "Collapse group"],
     [["l", "→"], "Expand group"],
     [["x", "space"], "Select tab, or all of a group's tabs"],
     [["m"], "Move selected tabs (or the tab) to another group"],
-    [["#"], "Mark selected tabs (or the tab) for closing"],
-    [["n"], "Propose your own group"],
+    [["#"], "Close focused or selected tabs immediately"],
+    [["n"], "Create group from focused or selected tabs now"],
     [["d"], "Delete a group you proposed"],
-    [["e"], "Rename new group"],
-    [["c"], "Change new group's color"],
+    [["e"], "Rename focused group"],
+    [["c"], "Change focused group color"],
     [["↵"], "Switch to that tab"],
     [["y"], "Copy the tab's full URL"],
     [["/"], "Filter"],
-    [["u"], "Pull in the AI answers that have arrived"],
+    [["u"], "Import ready AI suggestions"],
     [["r"], "Re-scan tabs (only new tabs are sorted)"],
     [["R"], "Ask the AI again: the group under the cursor, the selected tabs, or everything"],
     [["s"], "AI settings"],
     [["⇧", "↵"], "Apply the group under the cursor"],
+    [["Ctrl/Cmd+Z"], "Undo last action; closed tabs reopen URLs, without page state"],
     [["esc"], "Clear selection / filter"],
   ];
-  showOverlay(`<div class="dialog wide" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+  showOverlay(`<div class="dialog wide" tabindex="0" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
     <header>Keyboard shortcuts<small>Press Esc or ? to close</small></header>
     <div class="help">${keys.map(([ks, d]) => `<div><span>${ks.map((k) => `<kbd>${k}</kbd>`).join("")}</span><span>${d}</span></div>`).join("")}</div></div>`);
+  $("#overlayRoot .dialog").focus();
   S.modal = (e) => {
     if (e.key === "Escape" || e.key === "?") {
       e.preventDefault();
@@ -1433,13 +1230,24 @@ function onListOrBody(e: Event) {
 }
 
 document.addEventListener("keydown", (e) => {
-  if (S.modal) return S.modal(e);
+  if (S.modal) {
+    if (e.key === "Tab") {
+      const controls = [...document.querySelectorAll<HTMLElement>('#overlayRoot button:not([disabled]), #overlayRoot input, #overlayRoot select, #overlayRoot a, #overlayRoot [tabindex="0"]')].filter(el => el.getClientRects().length);
+      const at = controls.indexOf(document.activeElement as HTMLElement);
+      if (controls.length && (e.shiftKey && at <= 0 || !e.shiftKey && at === controls.length - 1)) {
+        e.preventDefault(); controls[e.shiftKey ? controls.length - 1 : 0].focus();
+      }
+    }
+    return S.modal(e);
+  }
   const target = e.target as HTMLElement;
-  if (target === filterEl || target.id === "rename-input") return;
+  if (target.matches("input, textarea, select, [contenteditable=true]")) return;
+  if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "z") { e.preventDefault(); void undo(); return; }
   if (e.metaKey || e.ctrlKey || e.altKey || S.busy) return;
   const k = e.key;
   // These work even before the first sort has finished.
   if (k === "s" || k === "?" || k === "n") {
+    S.autoPull = false;
     e.preventDefault();
     if (k === "s") openAiSettings();
     else if (k === "?") openHelp();
@@ -1448,7 +1256,7 @@ document.addEventListener("keydown", (e) => {
   }
   if (!S.plan) return;
   // Once AI answers are on screen and the user starts working through them, new ones wait for u.
-  if (S.pulled.size && k !== "u") S.autoPull = false;
+  if (k !== "u") S.autoPull = false;
   const r = curRow();
   let handled = true;
   if (k === "j" || k === "ArrowDown") moveCursor(1);
@@ -1501,8 +1309,10 @@ listEl.addEventListener("click", (e) => {
   const row = el.closest<HTMLElement>("[data-key]");
   if (!row || el.closest(".rename")) return;
   setCursor(row.dataset.key!);
-  if (S.pulled.size) S.autoPull = false;
+  S.autoPull = false;
   const r = curRow();
+  if (el.closest("[data-move]")) { openMove(); render(); return; }
+  if (el.closest("[data-close-tab]")) { void markClose(); return; }
   const apply = el.closest<HTMLElement>("[data-apply]");
   if (apply) {
     const b = S.plan && blocksOf(S.plan).find((x) => x.key === apply.dataset.apply);
@@ -1522,9 +1332,10 @@ listEl.addEventListener("dblclick", (e) => {
   if (r?.type === "item") void switchToTab(r.tabId);
 });
 
-$("#apply").addEventListener("click", () => void applyGroup());
-$("#propose").addEventListener("click", openPropose);
-$("#rescan").addEventListener("click", () => void rescan().then(() => toast("Re-scanned your tabs.")));
+$("#propose").addEventListener("click", () => openPropose());
+$("#help").addEventListener("click", openHelp);
+$("#settings").addEventListener("click", openAiSettings);
+$("#undo").addEventListener("click", () => void undo());
 
 // Re-scan whenever the dashboard comes back into view, or the toolbar button is pressed again.
 document.addEventListener("visibilitychange", () => {
@@ -1536,9 +1347,16 @@ chrome.runtime.onMessage.addListener((msg: { type?: string }) => {
 
 /* ---------------------------------------------------------------- start */
 
+new ResizeObserver(entries => {
+  const height = entries[0].target.getBoundingClientRect().height + 24;
+  document.documentElement.style.setProperty("--footer-clearance", `${height}px`);
+}).observe($(".applybar"));
+
 $("#version").textContent = `v${chrome.runtime.getManifest().version}`;
 
 (async () => {
+  const decisions = await chrome.storage.session.get("resolved");
+  for (const [id, url] of decisions.resolved ?? []) resolved.set(id, url);
   const stored = await loadState();
   S.userGroups = stored.userGroups;
   S.leftoversWindowId = stored.leftoversWindowId;
